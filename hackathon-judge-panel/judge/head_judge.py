@@ -1,17 +1,17 @@
 """
 Head Judge — final arbitration with debate protocol.
-
-Uses the EXPENSIVE model (Gemini 1.5 Pro) — exactly ONE call per
-evaluation run.  Reads all scores from the band room, applies weighted
-scoring, and triggers a debate protocol if scores are divergent (gap > 20).
+Subclasses SimpleAdapter to collaborate inside a Band Room.
 """
 
 import json
 
-from core.llm import get_smart_llm
-from core.band_room import read_score, get_fraud_result
-from headroom_config import WEIGHTS, DEBATE_THRESHOLD, RECOMMENDATION_TIERS
+from band.core.simple_adapter import SimpleAdapter
+from band.core.types import PlatformMessage, HistoryProvider
+from band.core.protocols import AgentToolsProtocol
 
+from core.llm import get_smart_llm
+from core.band_helper import has_responded_since, get_latest_payload_since
+from headroom_config import WEIGHTS, DEBATE_THRESHOLD, RECOMMENDATION_TIERS
 
 
 def _get_recommendation(score: float) -> str:
@@ -22,81 +22,129 @@ def _get_recommendation(score: float) -> str:
     return "Below threshold"
 
 
-async def final_judgment() -> dict:
-    """Produce the final evaluation by reading all judge scores.
+class HeadJudgeAgent(SimpleAdapter[HistoryProvider]):
+    """Head Judge Agent Adapter for the Band multi-agent room."""
 
-    Pipeline:
-      1. Read all scores + fraud result from SharedContext (band room).
-      2. If fraud → return DISQUALIFIED immediately.
-      3. Compute weighted score.
-      4. If score gap > DEBATE_THRESHOLD → trigger debate via expensive LLM.
-      5. Return final score, recommendation, and metadata.
+    async def on_message(
+        self,
+        msg: PlatformMessage,
+        tools: AgentToolsProtocol,
+        history: HistoryProvider,
+        participants_msg: str | None,
+        contacts_msg: str | None,
+        *,
+        is_session_bootstrap: bool,
+        room_id: str,
+    ) -> None:
+        all_msgs = history.raw + [{"content": msg.content}]
 
-    Returns:
-        Final evaluation dict with final_score, recommendation, scores,
-        debate_triggered, debate_summary, fraud_flags, and confidence.
-    """
-    # ---- Read scores from band room ----
-    scores = {}
-    score_details = {}
+        # Skip if Final Judgment is already rendered
+        if has_responded_since(all_msgs, "[Final Judgment]", "[Evaluate Submission]"):
+            return
 
-    score_keys = {
-        "business": "business_score",
-        "innovation": "innovation_score",
-        "band": "band_score",
-        "demo": "demo_score",
-    }
+        # Check for early abort due to fraud
+        fraud = get_latest_payload_since(all_msgs, "[Fraud Result]", "[Evaluate Submission]")
+        if fraud and fraud.get("abort_evaluation"):
+            result = {
+                "final_score": 0,
+                "recommendation": "DISQUALIFIED",
+                "scores": {},
+                "debate_triggered": False,
+                "debate_summary": "Evaluation aborted by fraud detector.",
+                "fraud_flags": fraud.get("flags", []),
+                "confidence": "high",
+            }
+            await tools.send_message(content=f"[Final Judgment] {json.dumps(result)}")
+            return
 
-    for category, score_field in score_keys.items():
-        data = read_score(category)
-        if data and isinstance(data, dict):
-            scores[category] = data.get(score_field, 50)
-            score_details[category] = data
-        else:
-            scores[category] = 50  # Default if missing.
-            score_details[category] = {"reasoning": "No data available."}
+        # Check if all Stage 2 scores are present in the room
+        biz_score = get_latest_payload_since(all_msgs, "[Score Business]", "[Evaluate Submission]")
+        innov_score = get_latest_payload_since(all_msgs, "[Score Innovation]", "[Evaluate Submission]")
+        band_score_data = get_latest_payload_since(all_msgs, "[Score Band]", "[Evaluate Submission]")
+        demo_score_data = get_latest_payload_since(all_msgs, "[Score Demo]", "[Evaluate Submission]")
 
-    # Code score comes from repo_analyzer's fraud_flags / architecture quality.
-    # Derive from the business judge's data as a proxy if no dedicated code judge.
-    code_data = read_score("code")
-    if code_data and isinstance(code_data, dict):
-        scores["code"] = code_data.get("code_score", 50)
-    else:
-        # Synthesise a code score from knowledge graph signals.
-        scores["code"] = 50
+        # We must wait for all 4 Stage 2 scores to be posted
+        if not biz_score or not innov_score or not band_score_data or not demo_score_data:
+            return
 
-    # ---- Check fraud ----
-    fraud = get_fraud_result()
-    if fraud is None:
-        fraud = {"fraud_score": 0, "flags": [], "abort_evaluation": False}
-
-    if fraud.get("abort_evaluation"):
-        return {
-            "final_score": 0,
-            "recommendation": "DISQUALIFIED",
-            "scores": scores,
-            "fraud_flags": fraud.get("flags", []),
-            "debate_triggered": False,
-            "debate_summary": None,
-            "confidence": "high",
+        # Gather base scores
+        scores = {
+            "business": biz_score.get("business_score", 50),
+            "innovation": innov_score.get("innovation_score", 50),
+            "band": band_score_data.get("band_score", 50),
+            "demo": demo_score_data.get("demo_score", 50),
+            "code": 50,  # default code score placeholder
         }
 
-    # ---- Compute gap and check for debate ----
-    score_vals = list(scores.values())
-    gap = max(score_vals) - min(score_vals)
+        # Check if repo flags can influence code score
+        repo_data = get_latest_payload_since(all_msgs, "[Repo Result]", "[Evaluate Submission]")
+        if repo_data:
+            scores["code"] = 90 if not repo_data.get("fraud_flags") else 50
+            if repo_data.get("has_tests"):
+                scores["code"] += 10
+            scores["code"] = min(scores["code"], 100)
 
-    debate_summary = None
-    if gap > DEBATE_THRESHOLD:
-        # Build reasoning context for the debate.
-        reasoning_context = {
-            cat: score_details.get(cat, {}).get("reasoning", "N/A")
-            for cat in score_keys
+        # ---- Case A: Debate Request not sent yet ----
+        if not has_responded_since(all_msgs, "[Debate Request]", "[Evaluate Submission]"):
+            score_vals = [scores["business"], scores["innovation"], scores["band"], scores["demo"]]
+            gap = max(score_vals) - min(score_vals)
+
+            if gap <= DEBATE_THRESHOLD:
+                # No debate needed — calculate final score and render judgment
+                weighted = sum(scores.get(k, 50) * w for k, w in WEIGHTS.items())
+                recommendation = _get_recommendation(weighted)
+
+                result = {
+                    "final_score": round(weighted, 1),
+                    "recommendation": recommendation,
+                    "scores": scores,
+                    "debate_triggered": False,
+                    "debate_summary": None,
+                    "fraud_flags": fraud.get("flags", []) if fraud else [],
+                    "confidence": "high",
+                }
+                await tools.send_message(content=f"[Final Judgment] {json.dumps(result)}")
+                return
+            else:
+                # Divergence found! Send Debate Request message to trigger judges
+                reasoning_context = {
+                    "business": biz_score.get("reasoning", "N/A"),
+                    "innovation": innov_score.get("reasoning", "N/A"),
+                    "band": band_score_data.get("reasoning", "N/A"),
+                    "demo": demo_score_data.get("reasoning", "N/A"),
+                }
+                debate_request = {
+                    "scores": scores,
+                    "reasoning": reasoning_context,
+                    "msg": "Judges, our scores diverge significantly! Please review and adjust."
+                }
+                await tools.send_message(content=f"[Debate Request] {json.dumps(debate_request)}")
+                return
+
+        # ---- Case B: Debate Request sent, checking for responses ----
+        # Wait for all debate responses to be posted
+        biz_debate = get_latest_payload_since(all_msgs, "[Debate Response Business]", "[Debate Request]")
+        innov_debate = get_latest_payload_since(all_msgs, "[Debate Response Innovation]", "[Debate Request]")
+        band_debate = get_latest_payload_since(all_msgs, "[Debate Response Band]", "[Debate Request]")
+        demo_debate = get_latest_payload_since(all_msgs, "[Debate Response Demo]", "[Debate Request]")
+
+        if not biz_debate or not innov_debate or not band_debate or not demo_debate:
+            return
+
+        # Compile debate responses
+        debate_responses = {
+            "business": biz_debate,
+            "innovation": innov_debate,
+            "band": band_debate,
+            "demo": demo_debate,
         }
 
-        debate_prompt = (
-            f"You are the Head Judge arbitrating divergent scores.\n\n"
-            f"Scores (gap: {gap} pts): {json.dumps(scores)}\n\n"
-            f"Reasoning from each judge:\n{json.dumps(reasoning_context, indent=2)}\n\n"
+        # Call expensive model for final arbitration over debate
+        llm = get_smart_llm()
+        arbitration_prompt = (
+            f"You are the Head Judge arbitrating divergent scores after a multi-agent debate.\n\n"
+            f"Original scores: {json.dumps(scores)}\n\n"
+            f"Debate responses from each judge:\n{json.dumps(debate_responses, indent=2)}\n\n"
             f"Explain which score(s) to trust and why. Be specific.\n"
             f"Return ONLY valid JSON:\n"
             f'{{\n'
@@ -105,13 +153,11 @@ async def final_judgment() -> dict:
             f'}}'
         )
 
-        messages = [("human", debate_prompt)]
-        llm = get_smart_llm()
-        response = llm.invoke(messages)
+        response = llm.invoke([("human", arbitration_prompt)])
 
         try:
             arbitration = json.loads(response.content)
-            # Apply adjusted scores (only for categories the LLM chose to adjust).
+            # Apply adjusted scores
             for cat, val in arbitration.get("adjusted_scores", {}).items():
                 if cat in scores and isinstance(val, (int, float)):
                     scores[cat] = val
@@ -119,16 +165,21 @@ async def final_judgment() -> dict:
         except json.JSONDecodeError:
             debate_summary = "Debate LLM response could not be parsed."
 
-    # ---- Weighted final score ----
-    weighted = sum(scores.get(k, 50) * w for k, w in WEIGHTS.items())
-    recommendation = _get_recommendation(weighted)
+        # Compute final weighted score
+        weighted = sum(scores.get(k, 50) * w for k, w in WEIGHTS.items())
+        recommendation = _get_recommendation(weighted)
 
-    return {
-        "final_score": round(weighted, 1),
-        "recommendation": recommendation,
-        "scores": scores,
-        "debate_triggered": gap > DEBATE_THRESHOLD,
-        "debate_summary": debate_summary,
-        "fraud_flags": fraud.get("flags", []),
-        "confidence": "high" if gap <= DEBATE_THRESHOLD else "medium",
-    }
+        result = {
+            "final_score": round(weighted, 1),
+            "recommendation": recommendation,
+            "scores": scores,
+            "debate_triggered": True,
+            "debate_summary": debate_summary,
+            "fraud_flags": fraud.get("flags", []) if fraud else [],
+            "confidence": "medium",
+        }
+        await tools.send_message(content=f"[Final Judgment] {json.dumps(result)}")
+
+
+# Singleton instance
+head_judge = HeadJudgeAgent()

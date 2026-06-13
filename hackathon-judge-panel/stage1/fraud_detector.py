@@ -1,47 +1,30 @@
 """
 Fraud Detector — runs in parallel with repo_analyzer.
-
-If fraud_score > FRAUD_ABORT_THRESHOLD (default 60), sets
-`abort_evaluation = True` which causes main.py to skip all Stage 2
-agents — saving their entire token budget.
-
-Compression note:
-  HeadroomChatModel automatically compresses context before every
-  LLM call, so we don't need manual compress() calls here.
+Subclasses SimpleAdapter to collaborate inside a Band Room.
 """
 
 import json
 
+from band.core.simple_adapter import SimpleAdapter
+from band.core.types import PlatformMessage, HistoryProvider
+from band.core.protocols import AgentToolsProtocol
+
 from core.llm import get_cheap_llm
 from core.band_room import post_fraud_result
+from core.band_helper import has_responded_since, get_latest_payload
 from headroom_config import FRAUD_README_MAX_CHARS, FRAUD_ABORT_THRESHOLD
 
 
-async def detect_fraud(
-    readme: str,
-    file_tree: list,
-    commit_dates: list,
-) -> dict:
-    """Run fraud heuristics via cheap LLM.
-
-    Runs in parallel with `repo_analyzer`.  If the fraud score is high
-    enough, the main pipeline aborts before Stage 2 — saving all
-    downstream tokens.
-
-    Args:
-        readme: Raw README content (truncated to FRAUD_README_MAX_CHARS).
-        file_tree: List of file paths in the repo.
-        commit_dates: ISO date strings of the last N commits.
-
-    Returns:
-        Dict with keys: fraud_score (0-100), flags (list), abort_evaluation (bool).
-    """
+async def detect_fraud_logic(submission: dict) -> dict:
+    """Run fraud heuristics via cheap LLM."""
     llm = get_cheap_llm()
+    readme = submission.get("readme", "")
+    description = submission.get("description", "")
+
     prompt = (
-        f"Check this hackathon submission for fraud.\n\n"
+        f"Check this hackathon submission for early signs of fraud, template copy-paste, or faked features.\n\n"
         f"README (truncated):\n{readme[:FRAUD_README_MAX_CHARS]}\n\n"
-        f"File tree:\n{json.dumps(file_tree)}\n\n"
-        f"Commit dates:\n{json.dumps(commit_dates)}\n\n"
+        f"Description:\n{description}\n\n"
         f"Return ONLY valid JSON:\n"
         f'{{\n'
         f'  "fraud_score": <0-100>,\n'
@@ -50,14 +33,11 @@ async def detect_fraud(
         f'}}\n\n'
         f"Set abort_evaluation = true if fraud_score > {FRAUD_ABORT_THRESHOLD}.\n"
         f"\nFraud checks:\n"
-        f"- All commits on a single day → 'single-day dump'\n"
-        f"- No requirements.txt or env file in tree → 'not runnable'\n"
-        f"- README mentions Band but no Band-related files → 'Band faked'\n"
-        f"- README claims N agents but tree has fewer agent files → 'agent count mismatch'\n"
-        f"- Very few files overall → 'minimal repo'\n"
+        f"- Description looks completely generated/faked\n"
+        f"- README has no instructions/details\n"
+        f"- Claims Band usage but description mentions alternative or no agent orchestration\n"
     )
 
-    # HeadroomChatModel auto-compresses before the LLM call.
     messages = [("human", prompt)]
     response = llm.invoke(messages)
 
@@ -70,10 +50,42 @@ async def detect_fraud(
             "abort_evaluation": False,
         }
 
-    # Ensure abort_evaluation is set correctly based on threshold.
     result["abort_evaluation"] = result.get("fraud_score", 0) > FRAUD_ABORT_THRESHOLD
-
-    # Post to band room so head_judge can read it.
-    post_fraud_result(result)
-
     return result
+
+
+class FraudDetectorAgent(SimpleAdapter[HistoryProvider]):
+    """Fraud Detector Agent Adapter for the Band multi-agent room."""
+
+    async def on_message(
+        self,
+        msg: PlatformMessage,
+        tools: AgentToolsProtocol,
+        history: HistoryProvider,
+        participants_msg: str | None,
+        contacts_msg: str | None,
+        *,
+        is_session_bootstrap: bool,
+        room_id: str,
+    ) -> None:
+        # Listen for evaluate submission trigger
+        if not msg.content.startswith("[Evaluate Submission]"):
+            return
+
+        # Check for duplicate response
+        if has_responded_since(history.raw, "[Fraud Result]", "[Evaluate Submission]"):
+            return
+
+        submission = get_latest_payload(history.raw + [{"content": msg.content}], "[Evaluate Submission]")
+        if not submission:
+            return
+
+        # Execute fraud logic
+        result = await detect_fraud_logic(submission)
+
+        # Broadcast the result as [Fraud Result] json
+        await tools.send_message(content=post_fraud_result(result))
+
+
+# Singleton instance
+fraud_detector = FraudDetectorAgent()

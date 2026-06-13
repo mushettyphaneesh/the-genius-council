@@ -1,18 +1,16 @@
 """
 Intake Agent — extracts structured submission metadata.
-
-Parses the submission dict (and optionally the README) to produce a
-normalised intake record with problem, solution, and track fields.
-Uses the cheap LLM only when the submission lacks structured fields.
-
-Compression note:
-  HeadroomChatModel automatically compresses context before every
-  LLM call, so we don't need manual compress() calls here.
+Subclasses SimpleAdapter to collaborate inside a Band Room.
 """
 
 import json
 
+from band.core.simple_adapter import SimpleAdapter
+from band.core.types import PlatformMessage, HistoryProvider
+from band.core.protocols import AgentToolsProtocol
+
 from core.llm import get_cheap_llm
+from core.band_helper import has_responded_since, get_latest_payload
 
 
 SYSTEM_PROMPT = """\
@@ -28,18 +26,8 @@ these keys:
 """
 
 
-async def extract_intake(submission: dict) -> dict:
-    """Extract or infer intake fields from the submission.
-
-    If the submission already has structured `problem`, `solution`, and
-    `track` keys, we skip the LLM call entirely — zero tokens spent.
-
-    Args:
-        submission: Raw submission dict from the hackathon platform.
-
-    Returns:
-        Dict with keys: problem, solution, track, team_size, key_features.
-    """
+async def extract_intake_logic(submission: dict) -> dict:
+    """Extract or infer intake fields from the submission."""
     # Fast path: structured data already present — no LLM needed.
     if all(k in submission for k in ("problem", "solution", "track")):
         return {
@@ -51,7 +39,6 @@ async def extract_intake(submission: dict) -> dict:
         }
 
     # Slow path: parse from description / README via cheap LLM.
-    # HeadroomChatModel auto-compresses before the LLM call.
     llm = get_cheap_llm()
     raw_text = submission.get("description", "")
     if submission.get("readme"):
@@ -67,7 +54,6 @@ async def extract_intake(submission: dict) -> dict:
     try:
         result = json.loads(response.content)
     except json.JSONDecodeError:
-        # Fallback — return what we can.
         result = {
             "problem": submission.get("description", "Unknown"),
             "solution": "Could not parse",
@@ -77,3 +63,41 @@ async def extract_intake(submission: dict) -> dict:
         }
 
     return result
+
+
+class IntakeAgent(SimpleAdapter[HistoryProvider]):
+    """Intake Agent Adapter for the Band multi-agent room."""
+
+    async def on_message(
+        self,
+        msg: PlatformMessage,
+        tools: AgentToolsProtocol,
+        history: HistoryProvider,
+        participants_msg: str | None,
+        contacts_msg: str | None,
+        *,
+        is_session_bootstrap: bool,
+        room_id: str,
+    ) -> None:
+        # Listen for evaluate submission trigger
+        if not msg.content.startswith("[Evaluate Submission]"):
+            return
+
+        # Check for duplicate response
+        if has_responded_since(history.raw, "[Intake Result]", "[Evaluate Submission]"):
+            return
+
+        # Fetch payload from current message (since history doesn't include current msg)
+        submission = get_latest_payload(history.raw + [{"content": msg.content}], "[Evaluate Submission]")
+        if not submission:
+            return
+
+        # Run extraction logic
+        result = await extract_intake_logic(submission)
+
+        # Broadcast the result back to the room
+        await tools.send_message(content=f"[Intake Result] {json.dumps(result)}")
+
+
+# Singleton instance
+intake_agent = IntakeAgent()

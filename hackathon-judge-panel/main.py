@@ -1,31 +1,13 @@
 """
 Hackathon Judge Panel — Main Orchestrator.
 
-Two-stage pipeline designed to minimize LLM token costs (~12k total):
-
-  Stage 1 (parallel, cheap model):
-    - intake_agent:   Extracts problem/solution/track from submission
-    - repo_analyzer:  ONLY agent that reads raw source code
-    - fraud_detector: Early abort if submission is fraudulent
-
-  Knowledge Graph:
-    - Built ONCE from Stage 1 outputs, compressed via Headroom
-
-  Stage 2 (parallel, cheap model):
-    - business_judge:   Market size, ROI, enterprise value
-    - innovation_judge: Novelty, creative AI usage
-    - band_judge:       Band framework integration quality
-    - demo_judge:       Presentation and prototype evidence
-
-  Final (single expensive call):
-    - head_judge:  Weighted scoring + debate protocol if scores diverge
-
-Usage:
-    python main.py
+Orchestrated fully through the Band multi-agent platform.
+All agents communicate and collaborate inside a shared Band Room.
 """
 
 import asyncio
 import json
+import os
 import sys
 
 from dotenv import load_dotenv
@@ -33,101 +15,95 @@ from dotenv import load_dotenv
 # Load .env before any module reads env vars.
 load_dotenv()
 
-from stage1.intake_agent import extract_intake
-from stage1.repo_analyzer import analyze_repo
-from stage1.fraud_detector import detect_fraud
-from core.knowledge_graph import build_knowledge_graph
-from stage2.business_judge import judge_business
-from stage2.innovation_judge import judge_innovation
-from stage2.band_judge import judge_band
-from stage2.demo_judge import judge_demo
-from judge.head_judge import final_judgment
+from core.band_simulator import MockBandRoom
+from stage1.intake_agent import intake_agent
+from stage1.repo_analyzer import repo_analyzer
+from stage1.fraud_detector import fraud_detector
+from stage1.kg_builder_agent import kg_builder_agent
+from stage2.business_judge import business_judge
+from stage2.innovation_judge import innovation_judge
+from stage2.band_judge import band_judge
+from stage2.demo_judge import demo_judge
+from judge.head_judge import head_judge
 
 
-async def evaluate(submission: dict) -> dict:
-    """Run the full two-stage evaluation pipeline.
+async def evaluate(submission: dict, use_prod: bool = False) -> dict:
+    """Run the multi-agent Band evaluation pipeline.
 
     Args:
-        submission: Dict with at least:
-            - github_url (str): Full GitHub URL
-            - description (str): Human-readable project summary
-            Optional:
-            - video_transcript (str): Demo video transcript
-            - readme (str): Pre-fetched README content
-            - problem, solution, track (str): Structured intake fields
+        submission: Dict with github_url, description, video_transcript, and readme.
+        use_prod: True if connecting to real Band cloud (requires API keys).
 
     Returns:
-        Final evaluation dict from the head judge.
+        Final evaluation verdict dict from Head Judge.
     """
+    if use_prod:
+        print("\n========================================================")
+        print("PRODUCTION MODE — Connecting to Band Platform (app.band.ai)")
+        print("========================================================\n")
+        print("To connect your agents to the real Band service, configure your")
+        print(".env with THENVOI_AGENT_ID and THENVOI_API_KEY. For example:\n")
+        print("    from band import Agent")
+        print("    agent = Agent.create(adapter=business_judge, agent_id='...', api_key='...')")
+        print("    await agent.run()\n")
+        print("Running in Local Simulation mode instead for local execution...\n")
+
     print("=" * 60)
-    print("HACKATHON JUDGE PANEL — Evaluation Starting")
+    print("HACKATHON JUDGE PANEL — Band Multi-Agent Evaluation")
     print("=" * 60)
 
-    # ------------------------------------------------------------------
-    # Stage 1 — intake + repo + fraud in parallel (cheap models)
-    # ------------------------------------------------------------------
-    print("\n[Stage 1] Running intake, repo analysis, and fraud detection...")
+    # 1. Initialize local Band Room simulator
+    room = MockBandRoom("hackathon-eval-room")
 
-    intake, repo_data, fraud = await asyncio.gather(
-        extract_intake(submission),
-        analyze_repo(submission["github_url"]),
-        detect_fraud(
-            submission.get("readme", ""),
-            [],  # file_tree — populated by repo_analyzer in production
-            [],  # commit_dates — populated by repo_analyzer in production
-        ),
-    )
+    # 2. Register all 9 agent adapters (Stage 1 + Stage 2 + Final)
+    room.register_adapter("IntakeAgent", intake_agent)
+    room.register_adapter("RepoAnalyzer", repo_analyzer)
+    room.register_adapter("FraudDetector", fraud_detector)
+    room.register_adapter("KGBuilderAgent", kg_builder_agent)
+    room.register_adapter("BusinessJudge", business_judge)
+    room.register_adapter("InnovationJudge", innovation_judge)
+    room.register_adapter("BandJudge", band_judge)
+    room.register_adapter("DemoJudge", demo_judge)
+    room.register_adapter("HeadJudge", head_judge)
 
-    print(f"  ✓ Intake: track={intake.get('track', 'N/A')}")
-    print(f"  ✓ Repo:   framework={repo_data.get('framework', 'N/A')}, "
-          f"agents={repo_data.get('agent_count', '?')}")
-    print(f"  ✓ Fraud:  score={fraud.get('fraud_score', 0)}, "
-          f"flags={fraud.get('flags', [])}")
+    # 3. Send initial trigger message to room to kick off evaluation
+    trigger_content = f"[Evaluate Submission] {json.dumps(submission)}"
+    await room.send_initial_message(trigger_content)
 
-    # ------------------------------------------------------------------
-    # Early abort if fraud detected — saves ALL Stage 2 tokens.
-    # ------------------------------------------------------------------
-    if fraud.get("abort_evaluation"):
-        print("\n⚠ FRAUD DETECTED — aborting evaluation.")
+    # 4. Wait for HeadJudge to post the [Final Judgment] message
+    timeout = 60.0
+    elapsed = 0.0
+    final_msg = None
+
+    while elapsed < timeout:
+        for m in room.messages:
+            if m["content"].startswith("[Final Judgment]"):
+                final_msg = m
+                break
+        if final_msg:
+            break
+        await asyncio.sleep(0.1)
+        elapsed += 0.1
+
+    if not final_msg:
+        print("❌ [Timeout] Evaluation did not complete within the timeout period.")
         return {
+            "error": "Evaluation timed out.",
             "final_score": 0,
-            "recommendation": "DISQUALIFIED",
-            "fraud_flags": fraud.get("flags", []),
-            "debate_triggered": False,
-            "debate_summary": None,
-            "confidence": "high",
-            "scores": {},
+            "recommendation": "ERROR",
         }
 
-    # ------------------------------------------------------------------
-    # Build compressed knowledge graph — ONCE.
-    # ------------------------------------------------------------------
-    print("\n[Knowledge Graph] Building compressed context...")
-    kg = build_knowledge_graph(repo_data, intake)
-    print(f"  ✓ KG keys: {list(kg.keys())}")
-
-    # ------------------------------------------------------------------
-    # Stage 2 — all judges run in parallel (cheap models, read KG only)
-    # ------------------------------------------------------------------
-    print("\n[Stage 2] Running domain judges in parallel...")
-
-    biz, innov, band, demo = await asyncio.gather(
-        judge_business(submission.get("description", "")),
-        judge_innovation(submission.get("description", "")),
-        judge_band(submission.get("description", "")),
-        judge_demo(submission.get("video_transcript", "")),
-    )
-
-    print(f"  ✓ Business:   {biz.get('business_score', '?')}/100")
-    print(f"  ✓ Innovation: {innov.get('innovation_score', '?')}/100")
-    print(f"  ✓ Band:       {band.get('band_score', '?')}/100")
-    print(f"  ✓ Demo:       {demo.get('demo_score', '?')}/100")
-
-    # ------------------------------------------------------------------
-    # Head Judge — single expensive model call.
-    # ------------------------------------------------------------------
-    print("\n[Head Judge] Final arbitration...")
-    result = await final_judgment()
+    # 5. Extract and parse result from the Final Judgment message
+    try:
+        raw_json = final_msg["content"][len("[Final Judgment]"):].strip()
+        result = json.loads(raw_json)
+    except Exception as e:
+        print(f"❌ [Error] Failed to parse Final Judgment payload: {e}")
+        result = {
+            "error": f"Parse error: {e}",
+            "final_score": 0,
+            "recommendation": "ERROR",
+        }
 
     print(f"\n{'=' * 60}")
     print(f"FINAL SCORE:      {result.get('final_score', 'N/A')}/100")
@@ -141,9 +117,6 @@ async def evaluate(submission: dict) -> dict:
     return result
 
 
-# ------------------------------------------------------------------
-# CLI entry point
-# ------------------------------------------------------------------
 if __name__ == "__main__":
     sample_submission = {
         "github_url": "https://github.com/example/project",
@@ -172,5 +145,9 @@ if __name__ == "__main__":
         ),
     }
 
-    result = asyncio.run(evaluate(sample_submission))
-    print("\n" + json.dumps(result, indent=2))
+    # Parse args
+    use_prod = "--prod" in sys.argv
+
+    result = asyncio.run(evaluate(sample_submission, use_prod=use_prod))
+    print("\nFinal Result Output:")
+    print(json.dumps(result, indent=2))

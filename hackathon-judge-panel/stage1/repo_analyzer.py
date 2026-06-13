@@ -1,12 +1,6 @@
 """
 Repo Analyzer — the ONLY agent allowed to read raw source code.
-
-Design invariant:
-  No other agent in the system ever sees repository file contents.
-  This agent reads README, requirements.txt, AGENTS.md, the file tree,
-  and commit metadata, then sends it to the LLM for structured analysis.
-  HeadroomChatModel auto-compresses before the LLM call.
-  Its structured JSON output feeds `build_knowledge_graph()`.
+Subclasses SimpleAdapter to collaborate inside a Band Room.
 """
 
 import json
@@ -14,7 +8,12 @@ import os
 
 from github import Github
 
+from band.core.simple_adapter import SimpleAdapter
+from band.core.types import PlatformMessage, HistoryProvider
+from band.core.protocols import AgentToolsProtocol
+
 from core.llm import get_cheap_llm
+from core.band_helper import has_responded_since, get_latest_payload
 from headroom_config import MAX_COMMITS
 
 
@@ -37,85 +36,132 @@ Fraud checks to perform:
 - Band mentioned in README but no Band import in code → flag "Band faked"
 """
 
-# Files we want to read in full (everything else is tree-only).
 KEY_FILES = {"README.md", "readme.md", "requirements.txt", "AGENTS.md",
              "pyproject.toml", "setup.py", "package.json"}
 
 
-async def analyze_repo(github_url: str) -> dict:
-    """Analyze a GitHub repository and return structured metadata.
-
-    This is the ONLY function in the system that touches raw source code.
-    HeadroomChatModel automatically compresses context before the LLM call.
-
-    Args:
-        github_url: Full GitHub URL, e.g. "https://github.com/org/repo"
-
-    Returns:
-        Structured dict consumed by `build_knowledge_graph()`.
-    """
+async def analyze_repo_logic(github_url: str, readme: str = "", description: str = "") -> dict:
+    """Analyze a GitHub repository or fallback to local files if token/network is missing."""
     llm = get_cheap_llm()
-    g = Github(os.getenv("GITHUB_TOKEN"))
-    repo_name = github_url.replace("https://github.com/", "")
-    repo = g.get_repo(repo_name)
+    token = os.getenv("GITHUB_TOKEN")
 
-    # ---- Collect key file contents (NOT all source files) ----
-    contents = []
-    try:
-        for f in repo.get_contents(""):
-            if f.name in KEY_FILES:
-                try:
-                    decoded = f.decoded_content.decode("utf-8", errors="replace")
-                    contents.append(f"=== {f.name} ===\n{decoded}")
-                except Exception:
-                    contents.append(f"=== {f.name} === (binary, skipped)")
-    except Exception as exc:
-        contents.append(f"(Error listing root: {exc})")
+    # If we have a token and a real URL (not example.com), try PyGithub
+    if token and github_url and "github.com" in github_url and "example" not in github_url:
+        try:
+            g = Github(token)
+            repo_name = github_url.replace("https://github.com/", "")
+            repo = g.get_repo(repo_name)
 
-    # ---- File tree (structure only, no contents) ----
-    try:
-        tree = [
-            c.path
-            for c in repo.get_git_tree(
-                repo.default_branch, recursive=True
-            ).tree
-        ]
-    except Exception:
-        tree = []
+            # Collect key file contents
+            contents = []
+            for f in repo.get_contents(""):
+                if f.name in KEY_FILES:
+                    try:
+                        decoded = f.decoded_content.decode("utf-8", errors="replace")
+                        contents.append(f"=== {f.name} ===\n{decoded}")
+                    except Exception:
+                        contents.append(f"=== {f.name} === (binary, skipped)")
 
-    # ---- Commit date metadata (not diffs) ----
-    try:
-        commits = list(repo.get_commits()[:MAX_COMMITS])
-        commit_dates = [c.commit.author.date.isoformat() for c in commits]
-    except Exception:
-        commit_dates = []
+            # File tree structure
+            try:
+                tree = [
+                    c.path
+                    for c in repo.get_git_tree(
+                        repo.default_branch, recursive=True
+                    ).tree
+                ]
+            except Exception:
+                tree = []
 
-    # ---- Assemble raw context string ----
-    raw_content = (
-        "\n".join(contents)
-        + f"\n\nFILE TREE:\n{json.dumps(tree)}"
-        + f"\n\nCOMMIT DATES (last {MAX_COMMITS}): {json.dumps(commit_dates)}"
+            # Commit metadata
+            try:
+                commits = list(repo.get_commits()[:MAX_COMMITS])
+                commit_dates = [c.commit.author.date.isoformat() for c in commits]
+            except Exception:
+                commit_dates = []
+
+            raw_content = (
+                "\n".join(contents)
+                + f"\n\nFILE TREE:\n{json.dumps(tree)}"
+                + f"\n\nCOMMIT DATES (last {MAX_COMMITS}): {json.dumps(commit_dates)}"
+            )
+
+            messages = [
+                ("system", SYSTEM_PROMPT),
+                ("human", raw_content),
+            ]
+
+            response = llm.invoke(messages)
+            return json.loads(response.content)
+
+        except Exception as exc:
+            print(f"  ⚠ GitHub integration failed ({exc}). Falling back to local context analysis.")
+
+    # Fallback/Local Analysis Mode: Analyse readme + description directly using LLM
+    fallback_content = (
+        f"README CONTENT:\n{readme}\n\n"
+        f"SUBMISSION DESCRIPTION:\n{description}\n\n"
+        f"FILE TREE: Mocked local workspace.\n"
+        f"COMMIT DATES: Mocked local dates."
     )
 
-    # ---- Send to LLM — HeadroomChatModel auto-compresses ----
     messages = [
         ("system", SYSTEM_PROMPT),
-        ("human", raw_content),
+        ("human", fallback_content),
     ]
 
     response = llm.invoke(messages)
 
     try:
-        analysis = json.loads(response.content)
+        return json.loads(response.content)
     except json.JSONDecodeError:
-        analysis = {
+        return {
             "framework": "unknown",
             "agent_count": 0,
             "band_usage": False,
             "tech_stack": [],
             "has_tests": False,
-            "architecture_summary": "Could not parse LLM response.",
+            "architecture_summary": "Fallback repo analysis due to JSON parsing error.",
             "fraud_flags": ["llm_parse_error"],
         }
 
-    return analysis
+
+class RepoAnalyzerAgent(SimpleAdapter[HistoryProvider]):
+    """Repo Analyzer Agent Adapter for the Band multi-agent room."""
+
+    async def on_message(
+        self,
+        msg: PlatformMessage,
+        tools: AgentToolsProtocol,
+        history: HistoryProvider,
+        participants_msg: str | None,
+        contacts_msg: str | None,
+        *,
+        is_session_bootstrap: bool,
+        room_id: str,
+    ) -> None:
+        # Listen for evaluate submission trigger
+        if not msg.content.startswith("[Evaluate Submission]"):
+            return
+
+        # Check for duplicate response
+        if has_responded_since(history.raw, "[Repo Result]", "[Evaluate Submission]"):
+            return
+
+        submission = get_latest_payload(history.raw + [{"content": msg.content}], "[Evaluate Submission]")
+        if not submission:
+            return
+
+        github_url = submission.get("github_url", "")
+        readme = submission.get("readme", "")
+        description = submission.get("description", "")
+
+        # Execute analysis logic
+        result = await analyze_repo_logic(github_url, readme, description)
+
+        # Post the result
+        await tools.send_message(content=f"[Repo Result] {json.dumps(result)}")
+
+
+# Singleton instance
+repo_analyzer = RepoAnalyzerAgent()
