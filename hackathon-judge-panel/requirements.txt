@@ -1,0 +1,5 @@
+headroom-ai[all,langchain]
+PyGithub
+langchain-google-genai
+langchain-openai
+python-dotenv
