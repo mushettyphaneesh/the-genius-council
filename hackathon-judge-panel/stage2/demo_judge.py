@@ -11,7 +11,7 @@ from band.core.protocols import AgentToolsProtocol
 
 from core.llm import get_cheap_llm
 from core.band_room import post_score
-from core.band_helper import has_responded_since, get_latest_payload_since
+from core.band_helper import has_responded_since, get_latest_payload_since, get_latest_payload
 
 
 SYSTEM_PROMPT = """\
@@ -143,7 +143,7 @@ class DemoJudgeAgent(SimpleAdapter[HistoryProvider]):
             return
 
         # Check if Stage 1 results + KG + Fraud exist in the room
-        submission = get_latest_payload_since(all_msgs, "[Evaluate Submission]", "[Evaluate Submission]")
+        submission = get_latest_payload(all_msgs, "[Evaluate Submission]")
         kg_payload = get_latest_payload_since(all_msgs, "[Knowledge Graph]", "[Evaluate Submission]")
         fraud = get_latest_payload_since(all_msgs, "[Fraud Result]", "[Evaluate Submission]")
 

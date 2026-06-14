@@ -23,7 +23,7 @@ class MockBandRoom:
         self.room_id = room_id
         self.adapters: dict[str, SimpleAdapter] = {}
         self.messages: list[dict[str, Any]] = []
-        self._queue: list[tuple[str, str, str]] = []
+        self._queue: list[dict[str, Any]] = []
         self._processing = False
 
     def register_adapter(self, name: str, adapter: SimpleAdapter) -> None:
@@ -31,13 +31,31 @@ class MockBandRoom:
         self.adapters[name] = adapter
         adapter.agent_name = name
 
+    def add_message_synchronously(self, content: str, sender_name: str, sender_type: str = "agent") -> dict[str, Any]:
+        """Adds a message to the room's message log immediately."""
+        msg_id = f"msg-{len(self.messages)}"
+        msg_dict = {
+            "id": msg_id,
+            "room_id": self.room_id,
+            "content": content,
+            "sender_id": f"id-{sender_name}",
+            "sender_type": sender_type,
+            "sender_name": sender_name,
+            "message_type": "text",
+            "metadata": {},
+            "created_at": None,
+        }
+        self.messages.append(msg_dict)
+        return msg_dict
+
     async def send_initial_message(self, content: str, sender_name: str = "Orchestrator") -> None:
         """Kicks off the evaluation by sending the initial trigger message."""
-        await self.broadcast_message(content, sender_name, "user")
+        msg_dict = self.add_message_synchronously(content, sender_name, "user")
+        await self.enqueue_for_broadcast(msg_dict)
 
-    async def broadcast_message(self, content: str, sender_name: str, sender_type: str = "agent") -> None:
+    async def enqueue_for_broadcast(self, msg_dict: dict[str, Any]) -> None:
         """Enqueues a message for broadcast."""
-        self._queue.append((content, sender_name, sender_type))
+        self._queue.append(msg_dict)
         if not self._processing:
             await self._process_queue()
 
@@ -45,21 +63,9 @@ class MockBandRoom:
         self._processing = True
         try:
             while self._queue:
-                content, sender_name, sender_type = self._queue.pop(0)
-
-                msg_id = f"msg-{len(self.messages)}"
-                msg_dict = {
-                    "id": msg_id,
-                    "room_id": self.room_id,
-                    "content": content,
-                    "sender_id": f"id-{sender_name}",
-                    "sender_type": sender_type,
-                    "sender_name": sender_name,
-                    "message_type": "text",
-                    "metadata": {},
-                    "created_at": None,
-                }
-                self.messages.append(msg_dict)
+                msg_dict = self._queue.pop(0)
+                sender_name = msg_dict["sender_name"]
+                content = msg_dict["content"]
 
                 # Nice visual output for the simulation
                 print(f"📡 [Band Room] {sender_name}: {content}")
@@ -83,19 +89,11 @@ class MockBandRoom:
                 self.sender = sender
 
             async def send_message(self, content: str, mentions: Any = None) -> dict[str, Any]:
-                # Non-blocking enqueue
-                asyncio.create_task(self.room.broadcast_message(content, self.sender))
-                return {
-                    "id": f"msg-reply-{uuid.uuid4()}",
-                    "room_id": self.room.room_id,
-                    "content": content,
-                    "sender_id": f"id-{self.sender}",
-                    "sender_type": "agent",
-                    "sender_name": self.sender,
-                    "message_type": "text",
-                    "metadata": {},
-                    "created_at": None,
-                }
+                # Add to messages synchronously so other agents in this tick see it in history
+                msg_reply = self.room.add_message_synchronously(content, self.sender)
+                # Non-blocking enqueue for delivery
+                asyncio.create_task(self.room.enqueue_for_broadcast(msg_reply))
+                return msg_reply
 
         tools = RoutingTools(self, name)
 

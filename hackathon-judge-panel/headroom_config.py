@@ -11,9 +11,14 @@ Achieved via:
 # Model routing
 # ---------------------------------------------------------------------------
 CHEAP_MODEL = "Qwen/Qwen2.5-72B-Instruct"
-CHEAP_BASE_URL = "https://api.featherless.ai/v1"
+CHEAP_BASE_URL = "https://api.aimlapi.com/v1"
 
-SMART_MODEL = "gemini-1.5-pro"
+# Smart model — used ONLY by the Head Judge for arbitration.
+# Primary: AI/ML API (preferred — keeps the entire pipeline on one provider).
+# Fallback: Google Gemini 1.5 Pro (if AIMLAPI_API_KEY is missing).
+SMART_MODEL_AIML = "meta-llama/Llama-3.3-70B-Instruct"
+SMART_BASE_URL = "https://api.aimlapi.com/v1"
+SMART_MODEL_GOOGLE = "gemini-1.5-pro"
 
 # ---------------------------------------------------------------------------
 # Compression settings

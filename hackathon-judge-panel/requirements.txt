@@ -1,3 +1,4 @@
+band-sdk
 headroom-ai[all,langchain]
 PyGithub
 langchain-google-genai
