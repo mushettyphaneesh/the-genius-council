@@ -12,6 +12,37 @@ import sys
 
 from dotenv import load_dotenv
 from band import Agent
+from band.runtime.tools import AgentTools
+
+# === DEBUG LOGGING PATCH — remove after diagnosing ===
+_original_send_event = AgentTools.send_event
+_original_send_message = AgentTools.send_message
+
+async def _debug_send_event(self, content: str, message_type: str, metadata=None):
+    print(f"[BAND SEND_EVENT] message_type={message_type}")
+    print(f"[BAND SEND_EVENT] Content preview: {content[:150]}")
+    try:
+        result = await _original_send_event(self, content, message_type, metadata)
+        print(f"[BAND SEND_EVENT] ✅ Success!")
+        return result
+    except Exception as e:
+        print(f"[BAND SEND_EVENT] ❌ FAILED: {e}")
+        raise
+
+async def _debug_send_message(self, content: str, mentions=None):
+    print(f"[BAND SEND_MSG] Content preview: {content[:150]}")
+    print(f"[BAND SEND_MSG] Mentions: {mentions}")
+    try:
+        result = await _original_send_message(self, content, mentions)
+        print(f"[BAND SEND_MSG] ✅ Success!")
+        return result
+    except Exception as e:
+        print(f"[BAND SEND_MSG] ❌ FAILED: {e}")
+        raise
+
+AgentTools.send_event = _debug_send_event
+AgentTools.send_message = _debug_send_message
+# === END DEBUG LOGGING PATCH ===
 
 # Load environment variables
 load_dotenv()

@@ -13,7 +13,7 @@ from band.core.types import PlatformMessage, HistoryProvider
 from band.core.protocols import AgentToolsProtocol
 
 from core.llm import get_cheap_llm
-from core.band_helper import has_responded_since, get_latest_payload
+from core.band_helper import has_responded_since, get_latest_payload, clean_and_loads_json, strip_band_mentions
 from headroom_config import MAX_COMMITS
 
 
@@ -92,7 +92,7 @@ async def analyze_repo_logic(github_url: str, readme: str = "", description: str
             ]
 
             response = llm.invoke(messages)
-            return json.loads(response.content)
+            return clean_and_loads_json(response.content)
 
         except Exception as exc:
             print(f"  ⚠ GitHub integration failed ({exc}). Falling back to local context analysis.")
@@ -113,8 +113,8 @@ async def analyze_repo_logic(github_url: str, readme: str = "", description: str
     response = llm.invoke(messages)
 
     try:
-        return json.loads(response.content)
-    except json.JSONDecodeError:
+        return clean_and_loads_json(response.content)
+    except Exception:
         return {
             "framework": "unknown",
             "agent_count": 0,
@@ -140,8 +140,11 @@ class RepoAnalyzerAgent(SimpleAdapter[HistoryProvider]):
         is_session_bootstrap: bool,
         room_id: str,
     ) -> None:
+        # Strip Band @[[uuid]] mentions from content before prefix checks
+        content = strip_band_mentions(msg.content)
+
         # Listen for evaluate submission trigger
-        if not msg.content.startswith("[Evaluate Submission]"):
+        if not content.startswith("[Evaluate Submission]"):
             return
 
         # Check for duplicate response
@@ -160,7 +163,7 @@ class RepoAnalyzerAgent(SimpleAdapter[HistoryProvider]):
         result = await analyze_repo_logic(github_url, readme, description)
 
         # Post the result
-        await tools.send_message(content=f"[Repo Result] {json.dumps(result)}")
+        await tools.send_event(content=f"[Repo Result] {json.dumps(result)}", message_type="task")
 
 
 # Singleton instance

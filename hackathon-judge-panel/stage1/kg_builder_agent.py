@@ -9,7 +9,7 @@ from band.core.simple_adapter import SimpleAdapter
 from band.core.types import PlatformMessage, HistoryProvider
 from band.core.protocols import AgentToolsProtocol
 
-from core.band_helper import has_responded_since, get_latest_payload_since
+from core.band_helper import has_responded_since, get_latest_payload_since, strip_band_mentions
 from core.knowledge_graph import build_knowledge_graph
 
 
@@ -35,11 +35,12 @@ class KGBuilderAgent(SimpleAdapter[HistoryProvider]):
         # We need to make sure we're in an active evaluation session
         has_trigger = False
         for m in reversed(history.raw):
-            if m.get("content", "").startswith("[Evaluate Submission]"):
+            if strip_band_mentions(m.get("content", "")).startswith("[Evaluate Submission]"):
                 has_trigger = True
                 break
         # Also check current message
-        if msg.content.startswith("[Evaluate Submission]"):
+        content = strip_band_mentions(msg.content)
+        if content.startswith("[Evaluate Submission]"):
             has_trigger = True
 
         if not has_trigger:
@@ -62,7 +63,7 @@ class KGBuilderAgent(SimpleAdapter[HistoryProvider]):
 
         # Broadcast the KG JSON payload to the room
         result_payload = {"knowledge_graph": compressed_kg}
-        await tools.send_message(content=f"[Knowledge Graph] {json.dumps(result_payload)}")
+        await tools.send_event(content=f"[Knowledge Graph] {json.dumps(result_payload)}", message_type="task")
 
 
 # Singleton instance

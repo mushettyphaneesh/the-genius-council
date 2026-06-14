@@ -10,7 +10,7 @@ from band.core.types import PlatformMessage, HistoryProvider
 from band.core.protocols import AgentToolsProtocol
 
 from core.llm import get_cheap_llm
-from core.band_helper import has_responded_since, get_latest_payload
+from core.band_helper import has_responded_since, get_latest_payload, clean_and_loads_json, strip_band_mentions
 
 
 SYSTEM_PROMPT = """\
@@ -52,8 +52,8 @@ async def extract_intake_logic(submission: dict) -> dict:
     response = llm.invoke(messages)
 
     try:
-        result = json.loads(response.content)
-    except json.JSONDecodeError:
+        result = clean_and_loads_json(response.content)
+    except Exception:
         result = {
             "problem": submission.get("description", "Unknown"),
             "solution": "Could not parse",
@@ -79,8 +79,18 @@ class IntakeAgent(SimpleAdapter[HistoryProvider]):
         is_session_bootstrap: bool,
         room_id: str,
     ) -> None:
+        # Strip Band @[[uuid]] mentions from content before prefix checks
+        content = strip_band_mentions(msg.content)
+
+        # === DEBUG LOGGING — remove after diagnosing ===
+        print(f"[IntakeAgent] ✅ on_message triggered!")
+        print(f"[IntakeAgent] Raw content: {msg.content[:200]}")
+        print(f"[IntakeAgent] Stripped content: {content[:200]}")
+        print(f"[IntakeAgent] Starts with [Evaluate Submission]: {content.startswith('[Evaluate Submission]')}")
+        # === END DEBUG LOGGING ===
+
         # Listen for evaluate submission trigger
-        if not msg.content.startswith("[Evaluate Submission]"):
+        if not content.startswith("[Evaluate Submission]"):
             return
 
         # Check for duplicate response
@@ -96,7 +106,7 @@ class IntakeAgent(SimpleAdapter[HistoryProvider]):
         result = await extract_intake_logic(submission)
 
         # Broadcast the result back to the room
-        await tools.send_message(content=f"[Intake Result] {json.dumps(result)}")
+        await tools.send_event(content=f"[Intake Result] {json.dumps(result)}", message_type="task")
 
 
 # Singleton instance

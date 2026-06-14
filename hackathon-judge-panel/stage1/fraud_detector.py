@@ -11,7 +11,7 @@ from band.core.protocols import AgentToolsProtocol
 
 from core.llm import get_cheap_llm
 from core.band_room import post_fraud_result
-from core.band_helper import has_responded_since, get_latest_payload
+from core.band_helper import has_responded_since, get_latest_payload, clean_and_loads_json, strip_band_mentions
 from headroom_config import FRAUD_README_MAX_CHARS, FRAUD_ABORT_THRESHOLD
 
 
@@ -42,8 +42,8 @@ async def detect_fraud_logic(submission: dict) -> dict:
     response = llm.invoke(messages)
 
     try:
-        result = json.loads(response.content)
-    except json.JSONDecodeError:
+        result = clean_and_loads_json(response.content)
+    except Exception:
         result = {
             "fraud_score": 0,
             "flags": ["llm_parse_error"],
@@ -68,8 +68,11 @@ class FraudDetectorAgent(SimpleAdapter[HistoryProvider]):
         is_session_bootstrap: bool,
         room_id: str,
     ) -> None:
+        # Strip Band @[[uuid]] mentions from content before prefix checks
+        content = strip_band_mentions(msg.content)
+
         # Listen for evaluate submission trigger
-        if not msg.content.startswith("[Evaluate Submission]"):
+        if not content.startswith("[Evaluate Submission]"):
             return
 
         # Check for duplicate response
@@ -84,7 +87,7 @@ class FraudDetectorAgent(SimpleAdapter[HistoryProvider]):
         result = await detect_fraud_logic(submission)
 
         # Broadcast the result as [Fraud Result] json
-        await tools.send_message(content=post_fraud_result(result))
+        await tools.send_event(content=post_fraud_result(result), message_type="task")
 
 
 # Singleton instance

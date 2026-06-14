@@ -10,7 +10,7 @@ from band.core.types import PlatformMessage, HistoryProvider
 from band.core.protocols import AgentToolsProtocol
 
 from core.llm import get_smart_llm
-from core.band_helper import has_responded_since, get_latest_payload_since
+from core.band_helper import has_responded_since, get_latest_payload_since, clean_and_loads_json
 from headroom_config import WEIGHTS, DEBATE_THRESHOLD, RECOMMENDATION_TIERS
 
 
@@ -54,7 +54,7 @@ class HeadJudgeAgent(SimpleAdapter[HistoryProvider]):
                 "fraud_flags": fraud.get("flags", []),
                 "confidence": "high",
             }
-            await tools.send_message(content=f"[Final Judgment] {json.dumps(result)}")
+            await tools.send_event(content=f"[Final Judgment] {json.dumps(result)}", message_type="task")
             return
 
         # Check if all Stage 2 scores are present in the room
@@ -103,7 +103,7 @@ class HeadJudgeAgent(SimpleAdapter[HistoryProvider]):
                     "fraud_flags": fraud.get("flags", []) if fraud else [],
                     "confidence": "high",
                 }
-                await tools.send_message(content=f"[Final Judgment] {json.dumps(result)}")
+                await tools.send_event(content=f"[Final Judgment] {json.dumps(result)}", message_type="task")
                 return
             else:
                 # Divergence found! Send Debate Request message to trigger judges
@@ -118,7 +118,7 @@ class HeadJudgeAgent(SimpleAdapter[HistoryProvider]):
                     "reasoning": reasoning_context,
                     "msg": "Judges, our scores diverge significantly! Please review and adjust."
                 }
-                await tools.send_message(content=f"[Debate Request] {json.dumps(debate_request)}")
+                await tools.send_event(content=f"[Debate Request] {json.dumps(debate_request)}", message_type="task")
                 return
 
         # ---- Case B: Debate Request sent, checking for responses ----
@@ -156,7 +156,7 @@ class HeadJudgeAgent(SimpleAdapter[HistoryProvider]):
         response = llm.invoke([("human", arbitration_prompt)])
 
         try:
-            arbitration = json.loads(response.content)
+            arbitration = clean_and_loads_json(response.content)
             # Apply adjusted scores
             for cat, val in arbitration.get("adjusted_scores", {}).items():
                 if cat in scores and isinstance(val, (int, float)):
@@ -178,7 +178,7 @@ class HeadJudgeAgent(SimpleAdapter[HistoryProvider]):
             "fraud_flags": fraud.get("flags", []) if fraud else [],
             "confidence": "medium",
         }
-        await tools.send_message(content=f"[Final Judgment] {json.dumps(result)}")
+        await tools.send_event(content=f"[Final Judgment] {json.dumps(result)}", message_type="task")
 
 
 # Singleton instance

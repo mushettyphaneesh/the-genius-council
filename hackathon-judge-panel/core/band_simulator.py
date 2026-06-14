@@ -95,6 +95,13 @@ class MockBandRoom:
                 asyncio.create_task(self.room.enqueue_for_broadcast(msg_reply))
                 return msg_reply
 
+            async def send_event(self, content: str, message_type: str, metadata: Any = None) -> dict[str, Any]:
+                # Events are routed identically to messages in local simulation
+                msg_reply = self.room.add_message_synchronously(content, self.sender)
+                # Non-blocking enqueue for delivery
+                asyncio.create_task(self.room.enqueue_for_broadcast(msg_reply))
+                return msg_reply
+
         tools = RoutingTools(self, name)
 
         # Build history containing previous messages (excluding the new one)

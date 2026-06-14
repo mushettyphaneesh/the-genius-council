@@ -11,7 +11,7 @@ from band.core.protocols import AgentToolsProtocol
 
 from core.llm import get_cheap_llm
 from core.band_room import post_score
-from core.band_helper import has_responded_since, get_latest_payload_since, get_latest_payload
+from core.band_helper import has_responded_since, get_latest_payload_since, get_latest_payload, clean_and_loads_json
 
 
 SYSTEM_PROMPT = """\
@@ -69,8 +69,8 @@ async def judge_band_logic(submission_description: str, kg_str: str) -> dict:
     response = llm.invoke(messages)
 
     try:
-        result = json.loads(response.content)
-    except json.JSONDecodeError:
+        result = clean_and_loads_json(response.content)
+    except Exception:
         result = {
             "band_score": 50,
             "reasoning": "Could not parse LLM response.",
@@ -120,15 +120,15 @@ class BandJudgeAgent(SimpleAdapter[HistoryProvider]):
                 ]
                 response = llm.invoke(messages)
                 try:
-                    debate_res = json.loads(response.content)
-                except json.JSONDecodeError:
+                    debate_res = clean_and_loads_json(response.content)
+                except Exception:
                     debate_res = {
                         "adjusted_score": original_score,
                         "justification": "Held ground due to parsing error."
                     }
 
                 # Send debate response
-                await tools.send_message(content=f"[Debate Response Band] {json.dumps(debate_res)}")
+                await tools.send_event(content=f"[Debate Response Band] {json.dumps(debate_res)}", message_type="task")
                 return
 
         # 2. Otherwise, perform initial scoring if we haven't done so yet
@@ -152,7 +152,7 @@ class BandJudgeAgent(SimpleAdapter[HistoryProvider]):
                 "strengths": [],
                 "weaknesses": ["fraud_abort"],
             }
-            await tools.send_message(content=post_score("band_judge", result))
+            await tools.send_event(content=post_score("band_judge", result), message_type="task")
             return
 
         # Run scoring logic
@@ -161,7 +161,7 @@ class BandJudgeAgent(SimpleAdapter[HistoryProvider]):
         result = await judge_band_logic(description, kg)
 
         # Broadcast score
-        await tools.send_message(content=post_score("band_judge", result))
+        await tools.send_event(content=post_score("band_judge", result), message_type="task")
 
 
 # Singleton instance
