@@ -13,7 +13,7 @@ from band.core.types import PlatformMessage, HistoryProvider
 from band.core.protocols import AgentToolsProtocol
 
 from core.llm import get_cheap_llm
-from core.band_helper import has_responded_since, get_latest_payload, clean_and_loads_json, strip_band_mentions
+from core.band_helper import has_responded_since, get_latest_payload, clean_and_loads_json, normalize_content
 from headroom_config import MAX_COMMITS
 
 
@@ -140,8 +140,8 @@ class RepoAnalyzerAgent(SimpleAdapter[HistoryProvider]):
         is_session_bootstrap: bool,
         room_id: str,
     ) -> None:
-        # Strip Band @[[uuid]] mentions from content before prefix checks
-        content = strip_band_mentions(msg.content)
+        # Normalize content: strip @[[uuid]] mentions + auto-detect raw JSON submissions
+        content = normalize_content(msg.content)
 
         # Listen for evaluate submission trigger
         if not content.startswith("[Evaluate Submission]"):

@@ -10,7 +10,7 @@ from band.core.types import PlatformMessage, HistoryProvider
 from band.core.protocols import AgentToolsProtocol
 
 from core.llm import get_cheap_llm
-from core.band_helper import has_responded_since, get_latest_payload, clean_and_loads_json, strip_band_mentions
+from core.band_helper import has_responded_since, get_latest_payload, clean_and_loads_json, normalize_content
 
 
 SYSTEM_PROMPT = """\
@@ -79,14 +79,14 @@ class IntakeAgent(SimpleAdapter[HistoryProvider]):
         is_session_bootstrap: bool,
         room_id: str,
     ) -> None:
-        # Strip Band @[[uuid]] mentions from content before prefix checks
-        content = strip_band_mentions(msg.content)
+        # Normalize content: strip @[[uuid]] mentions + auto-detect raw JSON submissions
+        content = normalize_content(msg.content)
 
         # === DEBUG LOGGING — remove after diagnosing ===
         print(f"[IntakeAgent] ✅ on_message triggered!")
-        print(f"[IntakeAgent] Raw content: {msg.content[:200]}")
-        print(f"[IntakeAgent] Stripped content: {content[:200]}")
-        print(f"[IntakeAgent] Starts with [Evaluate Submission]: {content.startswith('[Evaluate Submission]')}")
+        print(f"[IntakeAgent] Raw: {msg.content[:100]}")
+        print(f"[IntakeAgent] Normalized: {content[:100]}")
+        print(f"[IntakeAgent] Match: {content.startswith('[Evaluate Submission]')}")
         # === END DEBUG LOGGING ===
 
         # Listen for evaluate submission trigger
