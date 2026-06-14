@@ -5,19 +5,38 @@ Token budget target: ~12,000 tokens per evaluation run (down from 71k).
 Achieved via:
   1. Only ONE agent (repo_analyzer) ever reads raw source code
   2. Headroom compresses everything before it touches any LLM
+
+Cost strategy:
+  - Featherless Premium ($25/mo, promo BOA26 = free month):
+      Unlimited tokens, 4 concurrent connections, 32K context.
+      Powers ALL Stage 1 + Stage 2 agents (8 of 9 agents).
+  - AI/ML API ($10 credits):
+      Pay-per-token, used ONLY for Head Judge arbitration (0-1 calls/eval).
+      $10 lasts hundreds of evaluations.
 """
 
 # ---------------------------------------------------------------------------
-# Model routing
+# Model routing — Cheap tier (Featherless, unlimited tokens)
 # ---------------------------------------------------------------------------
-CHEAP_MODEL = "Qwen/Qwen2.5-72B-Instruct"
-CHEAP_BASE_URL = "https://api.aimlapi.com/v1"
+# Featherless is the primary provider for ALL Stage 1 + Stage 2 agents.
+# Unlimited monthly tokens with the Premium plan ($25/mo, promo BOA26).
+# 4 concurrent connections — perfectly matches our 4 parallel Stage 2 judges.
+FEATHERLESS_BASE_URL = "https://api.featherless.ai/v1"
+FEATHERLESS_MODEL = "Qwen/Qwen2.5-72B-Instruct"
 
-# Smart model — used ONLY by the Head Judge for arbitration.
-# Primary: AI/ML API (preferred — keeps the entire pipeline on one provider).
-# Fallback: Google Gemini 1.5 Pro (if AIMLAPI_API_KEY is missing).
+# AI/ML API as fallback cheap provider (pay-per-token)
+AIML_BASE_URL = "https://api.aimlapi.com/v1"
+AIML_CHEAP_MODEL = "Qwen/Qwen2.5-72B-Instruct"
+
+# ---------------------------------------------------------------------------
+# Model routing — Smart tier (AI/ML API, pay-per-token)
+# ---------------------------------------------------------------------------
+# Used ONLY by the Head Judge for final arbitration / debate protocol.
+# At most 1 call per evaluation → $10 in credits lasts hundreds of evals.
 SMART_MODEL_AIML = "meta-llama/Llama-3.3-70B-Instruct"
 SMART_BASE_URL = "https://api.aimlapi.com/v1"
+
+# Fallback: Google Gemini (if no AIMLAPI_API_KEY is set)
 SMART_MODEL_GOOGLE = "gemini-1.5-pro"
 
 # ---------------------------------------------------------------------------

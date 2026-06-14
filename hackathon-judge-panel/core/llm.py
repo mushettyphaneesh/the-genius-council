@@ -1,21 +1,22 @@
 """
 Two-tier LLM routing for the Hackathon Judge Panel.
 
-- get_cheap_llm()  → AI/ML API  Qwen 2.5-72B — used by ALL Stage 1 and
-                     Stage 2 agents.  Wrapped in HeadroomChatModel for
-                     automatic context compression.
-- get_smart_llm()  → AI/ML API  Llama-3.3-70B (primary) or Google Gemini
-                     1.5 Pro (fallback) — used ONLY by the Head Judge.
-                     Single call per evaluation run.
+Cost-optimized provider strategy:
 
-Routing priority for the smart model:
-  1. If AIMLAPI_API_KEY is set → use AI/ML API (keeps the entire pipeline
-     on a single provider, qualifying for the hackathon sponsor reward).
-  2. Else if GOOGLE_API_KEY is set → use Google Gemini 1.5 Pro.
-  3. Else → raise a clear error.
+  Cheap tier  → Featherless Premium (unlimited tokens, $25/mo, promo BOA26)
+                Used by ALL Stage 1 + Stage 2 agents (8 of 9 agents).
+                Falls back to AI/ML API if no Featherless key.
 
-Both functions use lazy initialization — the LLM instance is created on
-first call (after .env is loaded), then cached for reuse.
+  Smart tier  → AI/ML API Llama-3.3-70B (pay-per-token, $10 credits)
+                Used ONLY by Head Judge for debate arbitration (0-1 calls/eval).
+                Falls back to Google Gemini if no AIML key.
+
+Why this split works:
+  - Featherless charges $0/token (subscription model), so 95% of calls are free.
+  - The Head Judge makes at most 1 smart-model call per evaluation (only on debate).
+  - At ~2K tokens per arbitration call, $10 in AI/ML credits ≈ 500+ evaluations.
+
+Both tiers are wrapped in HeadroomChatModel for automatic context compression.
 """
 
 import os
@@ -25,8 +26,10 @@ from langchain_openai import ChatOpenAI
 from headroom.integrations.langchain import HeadroomChatModel
 
 from headroom_config import (
-    CHEAP_MODEL,
-    CHEAP_BASE_URL,
+    FEATHERLESS_BASE_URL,
+    FEATHERLESS_MODEL,
+    AIML_BASE_URL,
+    AIML_CHEAP_MODEL,
     SMART_MODEL_AIML,
     SMART_BASE_URL,
     SMART_MODEL_GOOGLE,
@@ -35,40 +38,58 @@ from headroom_config import (
 
 @lru_cache(maxsize=1)
 def get_cheap_llm() -> HeadroomChatModel:
-    """AI/ML API Qwen for all Stage 1 and Stage 2 agents.
+    """Cheap-tier LLM for all Stage 1 and Stage 2 agents.
+
+    Routing priority:
+      1. Featherless Premium → unlimited tokens, $0 per call (preferred).
+      2. AI/ML API           → pay-per-token fallback.
 
     Returns a HeadroomChatModel that automatically compresses context
     before every LLM call, keeping per-agent token usage minimal.
-
-    Lazily initialised on first call (cached via lru_cache).
     """
-    base = ChatOpenAI(
-        base_url=CHEAP_BASE_URL,
-        api_key=os.getenv("AIMLAPI_API_KEY") or os.getenv("FEATHERLESS_API_KEY"),
-        model=CHEAP_MODEL,
-    )
+    featherless_key = os.getenv("FEATHERLESS_API_KEY")
+    aiml_key = os.getenv("AIMLAPI_API_KEY")
+
+    if featherless_key:
+        # Primary: Featherless — unlimited tokens, subscription model
+        base = ChatOpenAI(
+            base_url=FEATHERLESS_BASE_URL,
+            api_key=featherless_key,
+            model=FEATHERLESS_MODEL,
+        )
+    elif aiml_key:
+        # Fallback: AI/ML API — pay-per-token
+        base = ChatOpenAI(
+            base_url=AIML_BASE_URL,
+            api_key=aiml_key,
+            model=AIML_CHEAP_MODEL,
+        )
+    else:
+        raise RuntimeError(
+            "No cheap-model API key found. "
+            "Set FEATHERLESS_API_KEY (preferred, unlimited tokens) "
+            "or AIMLAPI_API_KEY in your .env file."
+        )
+
     return HeadroomChatModel(base)
 
 
 @lru_cache(maxsize=1)
 def get_smart_llm() -> HeadroomChatModel:
-    """Smart model — Head Judge ONLY.  One call per evaluation.
+    """Smart-tier LLM — Head Judge ONLY.  At most 1 call per evaluation.
 
     Routing priority:
-      1. AI/ML API  → Llama-3.3-70B-Instruct (preferred, keeps entire
-         pipeline on a single provider for the hackathon sponsor reward).
-      2. Google Gemini 1.5 Pro → fallback if no AIMLAPI key is configured.
+      1. AI/ML API  → Llama-3.3-70B-Instruct (preferred, $10 lasts 500+ evals).
+      2. Google Gemini 1.5 Pro → fallback if no AIML key.
 
     Still wrapped in HeadroomChatModel so the already-compressed
     SharedContext payloads stay compact.
-
-    Lazily initialised on first call (cached via lru_cache).
     """
     aiml_key = os.getenv("AIMLAPI_API_KEY")
     google_key = os.getenv("GOOGLE_API_KEY")
 
     if aiml_key:
-        # Primary: AI/ML API — keeps entire pipeline on one provider
+        # Primary: AI/ML API — only used for Head Judge, very few calls
         base = ChatOpenAI(
             base_url=SMART_BASE_URL,
             api_key=aiml_key,
