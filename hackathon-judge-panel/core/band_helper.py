@@ -16,6 +16,23 @@ def strip_band_mentions(content: str) -> str:
     return re.sub(r'^(\s*@\[\[[a-f0-9-]+\]\]\s*)+', '', content).strip()
 
 
+def normalize_content(content: str) -> str:
+    """Strip Band mentions and auto-detect raw JSON submissions.
+
+    Band requires @mentions on every user message, so content always starts
+    with @[[uuid]]... The user cannot prepend [Evaluate Submission] before
+    the mentions. This function:
+    1. Strips @[[uuid]] mention patterns
+    2. If the remaining content is raw JSON containing 'github_url',
+       prepends [Evaluate Submission] so all downstream prefix checks work.
+    """
+    stripped = strip_band_mentions(content)
+    # Auto-detect raw JSON submissions (user can't type the prefix before @mentions)
+    if stripped.startswith("{") and "github_url" in stripped:
+        return f"[Evaluate Submission] {stripped}"
+    return stripped
+
+
 def extract_all_json_objects(s: str) -> list[dict]:
     """Find and parse all individual JSON objects in the string."""
     results = []
@@ -189,7 +206,7 @@ def has_responded_since(history_raw: list[dict], target_prefix: str, marker_pref
     If marker_prefix is encountered first, or target_prefix is not found, returns False.
     """
     for m in reversed(history_raw):
-        content = strip_band_mentions(m.get("content", ""))
+        content = normalize_content(m.get("content", ""))
         if content.startswith(marker_prefix):
             return False
         if content.startswith(target_prefix):
@@ -203,7 +220,7 @@ def get_latest_payload(history_raw: list[dict], prefix: str) -> Any | None:
     Parses the message content (excluding the prefix) as JSON.
     """
     for m in reversed(history_raw):
-        content = strip_band_mentions(m.get("content", ""))
+        content = normalize_content(m.get("content", ""))
         if content.startswith(prefix):
             try:
                 json_str = content[len(prefix):].strip()
@@ -216,7 +233,7 @@ def get_latest_payload(history_raw: list[dict], prefix: str) -> Any | None:
 def get_latest_payload_since(history_raw: list[dict], prefix: str, marker_prefix: str) -> Any | None:
     """Scan history backwards for the latest message starting with prefix since marker_prefix."""
     for m in reversed(history_raw):
-        content = strip_band_mentions(m.get("content", ""))
+        content = normalize_content(m.get("content", ""))
         if content.startswith(marker_prefix):
             return None
         if content.startswith(prefix):
