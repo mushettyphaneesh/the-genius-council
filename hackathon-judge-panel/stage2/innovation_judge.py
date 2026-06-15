@@ -4,6 +4,10 @@ Subclasses SimpleAdapter to collaborate inside a Band Room.
 """
 
 import json
+import re
+import time
+
+SESSION_START = time.time()
 
 from band.core.simple_adapter import SimpleAdapter
 from band.core.types import PlatformMessage, HistoryProvider
@@ -12,6 +16,35 @@ from band.core.protocols import AgentToolsProtocol
 from core.llm import get_cheap_llm
 from core.band_room import post_score
 from core.band_helper import has_responded_since, get_latest_payload_since, get_latest_payload, clean_and_loads_json
+
+
+def extract_json(text: str, default_val: dict) -> dict:
+    """Extract first valid JSON object from LLM response, returning default_val on failure."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    elif not isinstance(text, str):
+        text = str(text)
+
+    # Try direct parse first
+    try:
+        res = clean_and_loads_json(text.strip())
+        if isinstance(res, dict):
+            return res
+    except:
+        pass
+
+    # Find first { ... } block
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        try:
+            res = clean_and_loads_json(match.group())
+            if isinstance(res, dict):
+                return res
+        except:
+            pass
+
+    print(f"  ⚠ Could not parse JSON from LLM response, using defaults")
+    return default_val
 
 
 SYSTEM_PROMPT = """\
@@ -64,16 +97,13 @@ async def judge_innovation_logic(submission_description: str, kg: str) -> dict:
 
     response = llm.invoke(messages)
 
-    try:
-        result = clean_and_loads_json(response.content)
-    except Exception:
-        result = {
-            "innovation_score": 50,
-            "reasoning": "Could not parse LLM response.",
-            "confidence": "low",
-            "strengths": [],
-            "weaknesses": ["llm_parse_error"],
-        }
+    result = extract_json(response.content, {
+        "innovation_score": 50,
+        "reasoning": "Could not parse LLM response.",
+        "confidence": "low",
+        "strengths": [],
+        "weaknesses": ["llm_parse_error"],
+    })
 
     return result
 
@@ -92,6 +122,18 @@ class InnovationJudgeAgent(SimpleAdapter[HistoryProvider]):
         is_session_bootstrap: bool,
         room_id: str,
     ) -> None:
+        # Skip messages from before this session started
+        if hasattr(msg, 'created_at') and msg.created_at:
+            try:
+                import datetime
+                if isinstance(msg.created_at, datetime.datetime):
+                    msg_age = time.time() - msg.created_at.timestamp()
+                    if msg_age > 30:
+                        return  # silently skip old backlog
+            except:
+                pass
+
+        # All messages we process are since the last submission evaluation
         all_msgs = history.raw + [{"content": msg.content}]
 
         # 1. Listen for Debate Request (if we haven't responded to it yet)
@@ -115,13 +157,10 @@ class InnovationJudgeAgent(SimpleAdapter[HistoryProvider]):
                     ))
                 ]
                 response = llm.invoke(messages)
-                try:
-                    debate_res = clean_and_loads_json(response.content)
-                except Exception:
-                    debate_res = {
-                        "adjusted_score": original_score,
-                        "justification": "Held ground due to parsing error."
-                    }
+                debate_res = extract_json(response.content, {
+                    "adjusted_score": original_score,
+                    "justification": "Held ground due to parsing error."
+                })
 
                 # Send debate response
                 await tools.send_event(content=f"[Debate Response Innovation] {json.dumps(debate_res)}", message_type="task")

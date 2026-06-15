@@ -4,6 +4,10 @@ Subclasses SimpleAdapter to collaborate inside a Band Room.
 """
 
 import json
+import re
+import time
+
+SESSION_START = time.time()
 
 from band.core.simple_adapter import SimpleAdapter
 from band.core.types import PlatformMessage, HistoryProvider
@@ -11,6 +15,35 @@ from band.core.protocols import AgentToolsProtocol
 
 from core.llm import get_smart_llm
 from core.band_helper import has_responded_since, get_latest_payload_since, clean_and_loads_json
+
+
+def extract_json(text: str, default_val: dict) -> dict:
+    """Extract first valid JSON object from LLM response, returning default_val on failure."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    elif not isinstance(text, str):
+        text = str(text)
+
+    # Try direct parse first
+    try:
+        res = clean_and_loads_json(text.strip())
+        if isinstance(res, dict):
+            return res
+    except:
+        pass
+
+    # Find first { ... } block
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        try:
+            res = clean_and_loads_json(match.group())
+            if isinstance(res, dict):
+                return res
+        except:
+            pass
+
+    print(f"  ⚠ Could not parse JSON from LLM response, using defaults")
+    return default_val
 from headroom_config import WEIGHTS, DEBATE_THRESHOLD, RECOMMENDATION_TIERS
 
 
@@ -36,6 +69,17 @@ class HeadJudgeAgent(SimpleAdapter[HistoryProvider]):
         is_session_bootstrap: bool,
         room_id: str,
     ) -> None:
+        # Skip messages from before this session started
+        if hasattr(msg, 'created_at') and msg.created_at:
+            try:
+                import datetime
+                if isinstance(msg.created_at, datetime.datetime):
+                    msg_age = time.time() - msg.created_at.timestamp()
+                    if msg_age > 30:
+                        return  # silently skip old backlog
+            except:
+                pass
+
         all_msgs = history.raw + [{"content": msg.content}]
 
         # Skip if Final Judgment is already rendered
@@ -155,15 +199,15 @@ class HeadJudgeAgent(SimpleAdapter[HistoryProvider]):
 
         response = llm.invoke([("human", arbitration_prompt)])
 
-        try:
-            arbitration = clean_and_loads_json(response.content)
-            # Apply adjusted scores
-            for cat, val in arbitration.get("adjusted_scores", {}).items():
-                if cat in scores and isinstance(val, (int, float)):
-                    scores[cat] = val
-            debate_summary = arbitration.get("arbitration", "Debate completed.")
-        except json.JSONDecodeError:
-            debate_summary = "Debate LLM response could not be parsed."
+        arbitration = extract_json(response.content, {
+            "arbitration": "Debate LLM response could not be parsed.",
+            "adjusted_scores": {}
+        })
+        # Apply adjusted scores
+        for cat, val in arbitration.get("adjusted_scores", {}).items():
+            if cat in scores and isinstance(val, (int, float)):
+                scores[cat] = val
+        debate_summary = arbitration.get("arbitration", "Debate completed.")
 
         # Compute final weighted score
         weighted = sum(scores.get(k, 50) * w for k, w in WEIGHTS.items())

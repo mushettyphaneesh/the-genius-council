@@ -70,7 +70,7 @@ AGENT_REGISTRY = [
     ("HeadJudge", head_judge, "HEAD_JUDGE"),
 ]
 
-async def start_agent(name: str, adapter, env_prefix: str):
+async def start_agent(name: str, adapter, env_prefix: str, all_agents_list: list):
     """Start a single agent on the live Band platform."""
     agent_id = os.getenv(f"{env_prefix}_AGENT_ID")
     api_key = os.getenv(f"{env_prefix}_API_KEY")
@@ -82,26 +82,47 @@ async def start_agent(name: str, adapter, env_prefix: str):
     print(f"🚀 [Starting] {name} (Connecting to Band platform)...")
     try:
         agent = Agent.create(adapter=adapter, agent_id=agent_id, api_key=api_key)
+        all_agents_list.append(agent)
         await agent.run()
     except Exception as e:
         print(f"❌ [Error] Failed running {name}: {e}")
+
+async def keepalive(all_agents_list: list):
+    """Send a no-op to keep all WebSocket connections alive."""
+    while True:
+        await asyncio.sleep(8)  # Every 8 seconds, not 15
+        # Touch each agent's connection
+        for agent in all_agents_list:
+            try:
+                if hasattr(agent, '_execution_context'):
+                    ctx = agent._execution_context
+                    if hasattr(ctx, '_ws') and ctx._ws:
+                        await ctx._ws.ping()
+            except:
+                pass  # Never crash the keepalive loop
 
 async def main():
     print("=====================================================================")
     print("STARTING HACKATHON JUDGING PANEL ON PRODUCTION BAND PLATFORM")
     print("=====================================================================")
 
+    # List to track created agents
+    all_agents_list = []
+
     # Create task for each agent that has configured credentials
     tasks = []
     for name, adapter, prefix in AGENT_REGISTRY:
-        tasks.append(start_agent(name, adapter, prefix))
+        tasks.append(start_agent(name, adapter, prefix, all_agents_list))
 
     active_tasks = [t for t in tasks if t is not None]
     if not active_tasks:
         print("❌ No agents started. Please configure agent credentials in your .env file.")
         sys.exit(1)
 
-    await asyncio.gather(*active_tasks)
+    await asyncio.gather(
+        *active_tasks,
+        keepalive(all_agents_list)
+    )
 
 if __name__ == "__main__":
     try:

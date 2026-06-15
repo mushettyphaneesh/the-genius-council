@@ -20,10 +20,14 @@ Both tiers are wrapped in HeadroomChatModel for automatic context compression.
 """
 
 import os
+import random
+import threading
+import time
 from functools import lru_cache
 
 from langchain_openai import ChatOpenAI
 from headroom.integrations.langchain import HeadroomChatModel
+import openai
 
 from headroom_config import (
     FEATHERLESS_BASE_URL,
@@ -35,17 +39,54 @@ from headroom_config import (
     SMART_MODEL_GOOGLE,
 )
 
+_cheap_llm_lock = threading.Lock()
+_smart_llm_lock = threading.Lock()
+
+class ConcurrencySafeLLM:
+    """Wrapper that serialises calls using a lock and retries on 429 rate/concurrency limits."""
+
+    def __init__(self, wrapped_llm, lock: threading.Lock):
+        self.wrapped_llm = wrapped_llm
+        self.lock = lock
+
+    def invoke(self, messages, *args, **kwargs):
+        with self.lock:
+            max_retries = 5
+            base_delay = 2.0
+            for attempt in range(max_retries):
+                try:
+                    return self.wrapped_llm.invoke(messages, *args, **kwargs)
+                except openai.RateLimitError as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    print(f"⚠️  Rate limit / concurrency error: {e}. Retrying in {base_delay:.1f}s... (Attempt {attempt+1}/{max_retries})")
+                    time.sleep(base_delay + random.uniform(0.1, 1.0))
+                    base_delay *= 2
+                except Exception as e:
+                    err_msg = str(e).lower()
+                    if any(x in err_msg for x in ["429", "502", "503", "504", "rate limit", "concurrency"]):
+                        if attempt == max_retries - 1:
+                            raise
+                        print(f"⚠️  Temporary error: {e}. Retrying in {base_delay:.1f}s... (Attempt {attempt+1}/{max_retries})")
+                        time.sleep(base_delay + random.uniform(0.1, 1.0))
+                        base_delay *= 2
+                    else:
+                        raise
+
+    def __getattr__(self, name):
+        return getattr(self.wrapped_llm, name)
+
 
 @lru_cache(maxsize=1)
-def get_cheap_llm() -> HeadroomChatModel:
+def get_cheap_llm() -> ConcurrencySafeLLM:
     """Cheap-tier LLM for all Stage 1 and Stage 2 agents.
 
     Routing priority:
       1. Featherless Premium → unlimited tokens, $0 per call (preferred).
       2. AI/ML API           → pay-per-token fallback.
 
-    Returns a HeadroomChatModel that automatically compresses context
-    before every LLM call, keeping per-agent token usage minimal.
+    Returns a ConcurrencySafeLLM wrapped HeadroomChatModel that automatically
+    compresses context and serialises concurrent execution to avoid 429 errors.
     """
     featherless_key = os.getenv("FEATHERLESS_API_KEY")
     aiml_key = os.getenv("AIMLAPI_API_KEY")
@@ -71,19 +112,16 @@ def get_cheap_llm() -> HeadroomChatModel:
             "or AIMLAPI_API_KEY in your .env file."
         )
 
-    return HeadroomChatModel(base)
+    return ConcurrencySafeLLM(HeadroomChatModel(base), _cheap_llm_lock)
 
 
 @lru_cache(maxsize=1)
-def get_smart_llm() -> HeadroomChatModel:
+def get_smart_llm() -> ConcurrencySafeLLM:
     """Smart-tier LLM — Head Judge ONLY.  At most 1 call per evaluation.
 
     Routing priority:
       1. AI/ML API  → Llama-3.3-70B-Instruct (preferred, $10 lasts 500+ evals).
       2. Google Gemini 1.5 Pro → fallback if no AIML key.
-
-    Still wrapped in HeadroomChatModel so the already-compressed
-    SharedContext payloads stay compact.
     """
     aiml_key = os.getenv("AIMLAPI_API_KEY")
     google_key = os.getenv("GOOGLE_API_KEY")
@@ -109,4 +147,4 @@ def get_smart_llm() -> HeadroomChatModel:
             "Set AIMLAPI_API_KEY (preferred) or GOOGLE_API_KEY in your .env file."
         )
 
-    return HeadroomChatModel(base)
+    return ConcurrencySafeLLM(HeadroomChatModel(base), _smart_llm_lock)

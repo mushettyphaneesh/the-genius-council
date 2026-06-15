@@ -77,3 +77,12 @@ RECOMMENDATION_TIERS = [
     (55, "Average submission"),
     (0, "Below threshold"),
 ]
+
+# ---------------------------------------------------------------------------
+# Headroom config
+# ---------------------------------------------------------------------------
+HEADROOM_CONFIG = {
+    "model": "Qwen/Qwen2.5-72B-Instruct",
+    "target_tokens": 8000,   # Compress aggressively to stay under 32k
+}
+

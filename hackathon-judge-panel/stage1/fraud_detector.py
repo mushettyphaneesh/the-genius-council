@@ -4,6 +4,10 @@ Subclasses SimpleAdapter to collaborate inside a Band Room.
 """
 
 import json
+import re
+import time
+
+SESSION_START = time.time()
 
 from band.core.simple_adapter import SimpleAdapter
 from band.core.types import PlatformMessage, HistoryProvider
@@ -11,8 +15,42 @@ from band.core.protocols import AgentToolsProtocol
 
 from core.llm import get_cheap_llm
 from core.band_room import post_fraud_result
-from core.band_helper import has_responded_since, get_latest_payload, clean_and_loads_json, strip_band_mentions
+from core.band_helper import has_responded_since, get_latest_payload, clean_and_loads_json, normalize_content
 from headroom_config import FRAUD_README_MAX_CHARS, FRAUD_ABORT_THRESHOLD
+
+
+def extract_json(text: str) -> dict:
+    """Extract first valid JSON object from LLM response."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    elif not isinstance(text, str):
+        text = str(text)
+
+    # Try direct parse first
+    try:
+        res = clean_and_loads_json(text.strip())
+        if isinstance(res, dict):
+            return res
+    except:
+        pass
+
+    # Find first { ... } block
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        try:
+            res = clean_and_loads_json(match.group())
+            if isinstance(res, dict):
+                return res
+        except:
+            pass
+
+    # Last resort — return safe default
+    print(f"  ⚠ Could not parse JSON from LLM response, using defaults")
+    return {
+        "fraud_score": 0,
+        "flags": ["llm_parse_error"],
+        "abort_evaluation": False,
+    }
 
 
 async def detect_fraud_logic(submission: dict) -> dict:
@@ -40,15 +78,7 @@ async def detect_fraud_logic(submission: dict) -> dict:
 
     messages = [("human", prompt)]
     response = llm.invoke(messages)
-
-    try:
-        result = clean_and_loads_json(response.content)
-    except Exception:
-        result = {
-            "fraud_score": 0,
-            "flags": ["llm_parse_error"],
-            "abort_evaluation": False,
-        }
+    result = extract_json(response.content)
 
     result["abort_evaluation"] = result.get("fraud_score", 0) > FRAUD_ABORT_THRESHOLD
     return result
@@ -68,8 +98,19 @@ class FraudDetectorAgent(SimpleAdapter[HistoryProvider]):
         is_session_bootstrap: bool,
         room_id: str,
     ) -> None:
-        # Strip Band @[[uuid]] mentions from content before prefix checks
-        content = strip_band_mentions(msg.content)
+        # Skip messages from before this session started
+        if hasattr(msg, 'created_at') and msg.created_at:
+            try:
+                import datetime
+                if isinstance(msg.created_at, datetime.datetime):
+                    msg_age = time.time() - msg.created_at.timestamp()
+                    if msg_age > 30:
+                        return  # silently skip old backlog
+            except:
+                pass
+
+        # Normalize content: strip @[[uuid]] mentions + auto-detect raw JSON submissions
+        content = normalize_content(msg.content)
 
         # Listen for evaluate submission trigger
         if not content.startswith("[Evaluate Submission]"):

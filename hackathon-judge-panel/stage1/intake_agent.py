@@ -4,6 +4,10 @@ Subclasses SimpleAdapter to collaborate inside a Band Room.
 """
 
 import json
+import re
+import time
+
+SESSION_START = time.time()
 
 from band.core.simple_adapter import SimpleAdapter
 from band.core.types import PlatformMessage, HistoryProvider
@@ -11,6 +15,35 @@ from band.core.protocols import AgentToolsProtocol
 
 from core.llm import get_cheap_llm
 from core.band_helper import has_responded_since, get_latest_payload, clean_and_loads_json, normalize_content
+
+
+def extract_json(text: str, default_val: dict) -> dict:
+    """Extract first valid JSON object from LLM response, returning default_val on failure."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    elif not isinstance(text, str):
+        text = str(text)
+
+    # Try direct parse first
+    try:
+        res = clean_and_loads_json(text.strip())
+        if isinstance(res, dict):
+            return res
+    except:
+        pass
+
+    # Find first { ... } block
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        try:
+            res = clean_and_loads_json(match.group())
+            if isinstance(res, dict):
+                return res
+        except:
+            pass
+
+    print(f"  ⚠ Could not parse JSON from LLM response, using defaults")
+    return default_val
 
 
 SYSTEM_PROMPT = """\
@@ -51,16 +84,13 @@ async def extract_intake_logic(submission: dict) -> dict:
 
     response = llm.invoke(messages)
 
-    try:
-        result = clean_and_loads_json(response.content)
-    except Exception:
-        result = {
-            "problem": submission.get("description", "Unknown"),
-            "solution": "Could not parse",
-            "track": "general",
-            "team_size": None,
-            "key_features": [],
-        }
+    result = extract_json(response.content, {
+        "problem": submission.get("description", "Unknown"),
+        "solution": "Could not parse",
+        "track": "general",
+        "team_size": None,
+        "key_features": [],
+    })
 
     return result
 
@@ -79,6 +109,17 @@ class IntakeAgent(SimpleAdapter[HistoryProvider]):
         is_session_bootstrap: bool,
         room_id: str,
     ) -> None:
+        # Skip messages from before this session started
+        if hasattr(msg, 'created_at') and msg.created_at:
+            try:
+                import datetime
+                if isinstance(msg.created_at, datetime.datetime):
+                    msg_age = time.time() - msg.created_at.timestamp()
+                    if msg_age > 30:
+                        return  # silently skip old backlog
+            except:
+                pass
+
         # Normalize content: strip @[[uuid]] mentions + auto-detect raw JSON submissions
         content = normalize_content(msg.content)
 

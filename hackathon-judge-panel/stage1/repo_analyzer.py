@@ -5,6 +5,10 @@ Subclasses SimpleAdapter to collaborate inside a Band Room.
 
 import json
 import os
+import re
+import time
+
+SESSION_START = time.time()
 
 from github import Github
 
@@ -15,6 +19,44 @@ from band.core.protocols import AgentToolsProtocol
 from core.llm import get_cheap_llm
 from core.band_helper import has_responded_since, get_latest_payload, clean_and_loads_json, normalize_content
 from headroom_config import MAX_COMMITS
+
+
+def extract_json(text: str) -> dict:
+    """Extract first valid JSON object from LLM response."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    elif not isinstance(text, str):
+        text = str(text)
+
+    # Try direct parse first
+    try:
+        res = clean_and_loads_json(text.strip())
+        if isinstance(res, dict):
+            return res
+    except:
+        pass
+
+    # Find first { ... } block
+    match = re.search(r'\{.*\}', text, re.DOTALL)
+    if match:
+        try:
+            res = clean_and_loads_json(match.group())
+            if isinstance(res, dict):
+                return res
+        except:
+            pass
+
+    # Last resort — return safe default
+    print(f"  ⚠ Could not parse JSON from LLM response, using defaults")
+    return {
+        "framework": "Unknown",
+        "agent_count": 0,
+        "band_usage": False,
+        "tech_stack": [],
+        "has_tests": False,
+        "architecture_summary": "Could not parse repository.",
+        "fraud_flags": ["parse_error"]
+    }
 
 
 SYSTEM_PROMPT = """\
@@ -38,6 +80,14 @@ Fraud checks to perform:
 
 KEY_FILES = {"README.md", "readme.md", "requirements.txt", "AGENTS.md",
              "pyproject.toml", "setup.py", "package.json"}
+
+
+def truncate_to_token_limit(text: str, max_chars: int = 40000) -> str:
+    if len(text) > max_chars:
+        print(f"  ✂ Truncating content: {len(text)} → {max_chars} chars")
+        return text[:max_chars] + "\n\n[TRUNCATED]"
+    return text
+
 
 
 async def analyze_repo_logic(github_url: str, readme: str = "", description: str = "") -> dict:
@@ -86,13 +136,15 @@ async def analyze_repo_logic(github_url: str, readme: str = "", description: str
                 + f"\n\nCOMMIT DATES (last {MAX_COMMITS}): {json.dumps(commit_dates)}"
             )
 
+            raw_content = truncate_to_token_limit(raw_content)
+
             messages = [
                 ("system", SYSTEM_PROMPT),
                 ("human", raw_content),
             ]
 
             response = llm.invoke(messages)
-            return clean_and_loads_json(response.content)
+            return extract_json(response.content)
 
         except Exception as exc:
             print(f"  ⚠ GitHub integration failed ({exc}). Falling back to local context analysis.")
@@ -111,19 +163,7 @@ async def analyze_repo_logic(github_url: str, readme: str = "", description: str
     ]
 
     response = llm.invoke(messages)
-
-    try:
-        return clean_and_loads_json(response.content)
-    except Exception:
-        return {
-            "framework": "unknown",
-            "agent_count": 0,
-            "band_usage": False,
-            "tech_stack": [],
-            "has_tests": False,
-            "architecture_summary": "Fallback repo analysis due to JSON parsing error.",
-            "fraud_flags": ["llm_parse_error"],
-        }
+    return extract_json(response.content)
 
 
 class RepoAnalyzerAgent(SimpleAdapter[HistoryProvider]):
@@ -140,6 +180,17 @@ class RepoAnalyzerAgent(SimpleAdapter[HistoryProvider]):
         is_session_bootstrap: bool,
         room_id: str,
     ) -> None:
+        # Skip messages from before this session started
+        if hasattr(msg, 'created_at') and msg.created_at:
+            try:
+                import datetime
+                if isinstance(msg.created_at, datetime.datetime):
+                    msg_age = time.time() - msg.created_at.timestamp()
+                    if msg_age > 30:
+                        return  # silently skip old backlog
+            except:
+                pass
+
         # Normalize content: strip @[[uuid]] mentions + auto-detect raw JSON submissions
         content = normalize_content(msg.content)
 

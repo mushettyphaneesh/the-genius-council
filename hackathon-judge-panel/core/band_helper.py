@@ -180,6 +180,8 @@ def clean_and_loads_json(content: str | bytes) -> Any:
     # Try extracting all individual JSON objects and merging them
     objects = extract_all_json_objects(s)
     if objects:
+        if len(objects) == 1:
+            return standardize_score_dict(objects[0])
         return merge_json_objects(objects)
 
     # Fallback to single outer brace extraction
