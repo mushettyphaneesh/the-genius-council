@@ -7,6 +7,9 @@ import re
 from typing import Any
 
 
+PROCESSED_MESSAGE_IDS = {}
+
+
 def strip_band_mentions(content: str) -> str:
     """Strip Band @[[uuid]] mention patterns from the beginning of message content.
 

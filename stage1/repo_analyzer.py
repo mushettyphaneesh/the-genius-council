@@ -17,7 +17,7 @@ from band.core.types import PlatformMessage, HistoryProvider
 from band.core.protocols import AgentToolsProtocol
 
 from core.llm import get_cheap_llm
-from core.band_helper import has_responded_since, get_latest_payload, clean_and_loads_json, normalize_content
+from core.band_helper import has_responded_since, get_latest_payload, clean_and_loads_json, normalize_content, PROCESSED_MESSAGE_IDS
 from headroom_config import MAX_COMMITS
 
 
@@ -180,6 +180,17 @@ class RepoAnalyzerAgent(SimpleAdapter[HistoryProvider]):
         is_session_bootstrap: bool,
         room_id: str,
     ) -> None:
+        # Deduplicate — never process the same message twice
+        msg_id = getattr(msg, 'id', None)
+        agent_name = self.__class__.__name__
+        if msg_id:
+            if agent_name not in PROCESSED_MESSAGE_IDS:
+                PROCESSED_MESSAGE_IDS[agent_name] = set()
+            if msg_id in PROCESSED_MESSAGE_IDS[agent_name]:
+                print(f"[{agent_name}] Skipping duplicate message {msg_id[:8]}...")
+                return
+            PROCESSED_MESSAGE_IDS[agent_name].add(msg_id)
+
         # Skip messages from before this session started
         if hasattr(msg, 'created_at') and msg.created_at:
             try:

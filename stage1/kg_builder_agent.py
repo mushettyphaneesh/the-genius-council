@@ -12,8 +12,10 @@ from band.core.simple_adapter import SimpleAdapter
 from band.core.types import PlatformMessage, HistoryProvider
 from band.core.protocols import AgentToolsProtocol
 
-from core.band_helper import has_responded_since, get_latest_payload_since, normalize_content
+from core.band_helper import has_responded_since, get_latest_payload_since, normalize_content, get_latest_payload, PROCESSED_MESSAGE_IDS
 from core.knowledge_graph import build_knowledge_graph
+
+KG_BUILT_FOR_MESSAGES = set()
 
 
 class KGBuilderAgent(SimpleAdapter[HistoryProvider]):
@@ -30,7 +32,26 @@ class KGBuilderAgent(SimpleAdapter[HistoryProvider]):
         is_session_bootstrap: bool,
         room_id: str,
     ) -> None:
+        # Deduplicate — never process the same message twice
+        msg_id = getattr(msg, 'id', None)
+        agent_name = self.__class__.__name__
+        if msg_id:
+            if agent_name not in PROCESSED_MESSAGE_IDS:
+                PROCESSED_MESSAGE_IDS[agent_name] = set()
+            if msg_id in PROCESSED_MESSAGE_IDS[agent_name]:
+                print(f"[{agent_name}] Skipping duplicate message {msg_id[:8]}...")
+                return
+            PROCESSED_MESSAGE_IDS[agent_name].add(msg_id)
+
         all_msgs = history.raw + [{"content": msg.content}]
+
+        # Check if we have already built the KG for this submission (by github_url)
+        submission = get_latest_payload(all_msgs, "[Evaluate Submission]")
+        submission_id = None
+        if submission:
+            submission_id = submission.get("github_url", "")
+            if submission_id and submission_id in KG_BUILT_FOR_MESSAGES:
+                return
 
         # Check if Stage 1 results exist in the room for the current evaluation session
         has_intake = get_latest_payload_since(all_msgs, "[Intake Result]", "[Evaluate Submission]") is not None
@@ -93,6 +114,9 @@ class KGBuilderAgent(SimpleAdapter[HistoryProvider]):
         # Broadcast the KG JSON payload to the room
         result_payload = {"knowledge_graph": compressed_kg}
         await tools.send_event(content=f"[Knowledge Graph] {json.dumps(result_payload)}", message_type="task")
+
+        if submission_id:
+            KG_BUILT_FOR_MESSAGES.add(submission_id)
 
 
 # Singleton instance

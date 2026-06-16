@@ -154,6 +154,14 @@ core.llm.get_smart_llm = lambda: MockSmartLLM()
 from main import evaluate
 
 class TestHackathonJudgePanel(unittest.TestCase):
+    def setUp(self):
+        # Clear global state to ensure clean test runs in the same process
+        from core.band_helper import PROCESSED_MESSAGE_IDS
+        PROCESSED_MESSAGE_IDS.clear()
+
+        from stage1.kg_builder_agent import KG_BUILT_FOR_MESSAGES
+        KG_BUILT_FOR_MESSAGES.clear()
+
     def test_normal_scenario(self):
         global CURRENT_SCENARIO
         CURRENT_SCENARIO = "normal"

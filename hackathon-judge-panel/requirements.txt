@@ -1,6 +1,6 @@
-band-sdk
-headroom-ai[all,langchain]
-PyGithub
-langchain-google-genai
-langchain-openai
-python-dotenv
+band-sdk==0.15.1
+headroom-ai[all,langchain]==0.2.7
+PyGithub==2.1.1
+langchain-google-genai==1.0.15
+langchain-openai==1.7.2
+python-dotenv==1.0.1

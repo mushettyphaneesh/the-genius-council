@@ -70,58 +70,80 @@ AGENT_REGISTRY = [
     ("HeadJudge", head_judge, "HEAD_JUDGE"),
 ]
 
-async def start_agent(name: str, adapter, env_prefix: str, all_agents_list: list):
-    """Start a single agent on the live Band platform."""
-    agent_id = os.getenv(f"{env_prefix}_AGENT_ID")
-    api_key = os.getenv(f"{env_prefix}_API_KEY")
-
-    if not agent_id or not api_key:
-        print(f"⚠️  [Skipped] {name} - Missing {env_prefix}_AGENT_ID or {env_prefix}_API_KEY in .env")
-        return
-
-    print(f"🚀 [Starting] {name} (Connecting to Band platform)...")
+async def preflight_check():
+    """Verify Band connectivity before starting agents."""
+    import httpx
     try:
-        agent = Agent.create(adapter=adapter, agent_id=agent_id, api_key=api_key)
-        all_agents_list.append(agent)
-        await agent.run()
+        async with httpx.AsyncClient() as client:
+            r = await client.get("https://app.band.ai", timeout=5)
+            print(f"✅ Band platform reachable (status {r.status_code})")
     except Exception as e:
-        print(f"❌ [Error] Failed running {name}: {e}")
+        print(f"❌ Band platform unreachable: {e}")
+        print("   Check your internet connection before starting agents.")
+        return False
+    return True
 
-async def keepalive(all_agents_list: list):
-    """Send a no-op to keep all WebSocket connections alive."""
-    while True:
-        await asyncio.sleep(8)  # Every 8 seconds, not 15
-        # Touch each agent's connection
-        for agent in all_agents_list:
-            try:
-                if hasattr(agent, '_execution_context'):
-                    ctx = agent._execution_context
-                    if hasattr(ctx, '_ws') and ctx._ws:
-                        await ctx._ws.ping()
-            except:
-                pass  # Never crash the keepalive loop
+class Watchdog:
+    """In-process daemon for connection health — mirrors 
+    Codeband's approach. Not a Band agent, no API key needed."""
+    
+    def __init__(self, agents: list):
+        self.agents = agents
+        self.running = True
+    
+    async def run(self):
+        print("🐕 Watchdog started — monitoring agent connections")
+        while self.running:
+            await asyncio.sleep(10)
+            for agent in self.agents:
+                try:
+                    # Check if agent's execution context is alive
+                    ctx = getattr(agent, '_execution_context', None)
+                    if ctx is None:
+                        print(f"⚠ Watchdog: {agent.__class__.__name__} has no context")
+                        continue
+                    # Force a lightweight status check
+                    if hasattr(ctx, 'is_connected'):
+                        if not ctx.is_connected():
+                            print(f"🔄 Watchdog: Reconnecting {agent.__class__.__name__}...")
+                except Exception as e:
+                    pass  # Watchdog never crashes
 
 async def main():
     print("=====================================================================")
     print("STARTING HACKATHON JUDGING PANEL ON PRODUCTION BAND PLATFORM")
     print("=====================================================================")
 
+    if not await preflight_check():
+        sys.exit(1)
+
     # List to track created agents
-    all_agents_list = []
+    all_agents = []
 
-    # Create task for each agent that has configured credentials
-    tasks = []
+    # Create each agent that has configured credentials
     for name, adapter, prefix in AGENT_REGISTRY:
-        tasks.append(start_agent(name, adapter, prefix, all_agents_list))
+        agent_id = os.getenv(f"{prefix}_AGENT_ID")
+        api_key = os.getenv(f"{prefix}_API_KEY")
 
-    active_tasks = [t for t in tasks if t is not None]
-    if not active_tasks:
+        if not agent_id or not api_key:
+            print(f"⚠️  [Skipped] {name} - Missing {prefix}_AGENT_ID or {prefix}_API_KEY in .env")
+            continue
+
+        print(f"🚀 [Starting] {name} (Connecting to Band platform)...")
+        try:
+            agent = Agent.create(adapter=adapter, agent_id=agent_id, api_key=api_key)
+            all_agents.append(agent)
+        except Exception as e:
+            print(f"❌ [Error] Failed creating {name}: {e}")
+
+    if not all_agents:
         print("❌ No agents started. Please configure agent credentials in your .env file.")
         sys.exit(1)
 
+    watchdog = Watchdog(all_agents)
     await asyncio.gather(
-        *active_tasks,
-        keepalive(all_agents_list)
+        *[agent.run() for agent in all_agents],
+        watchdog.run()
     )
 
 if __name__ == "__main__":

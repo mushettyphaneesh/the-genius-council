@@ -1,5 +1,5 @@
 """
-Demo / Presentation Judge — Stage 2 agent.
+Business Value Judge — Stage 2 agent.
 Subclasses SimpleAdapter to collaborate inside a Band Room.
 """
 
@@ -15,7 +15,7 @@ from band.core.protocols import AgentToolsProtocol
 
 from core.llm import get_cheap_llm
 from core.band_room import post_score
-from core.band_helper import has_responded_since, get_latest_payload_since, get_latest_payload, clean_and_loads_json
+from core.band_helper import has_responded_since, get_latest_payload_since, get_latest_payload, clean_and_loads_json, PROCESSED_MESSAGE_IDS
 
 
 def extract_json(text: str, default_val: dict) -> dict:
@@ -48,32 +48,29 @@ def extract_json(text: str, default_val: dict) -> dict:
 
 
 SYSTEM_PROMPT = """\
-You are a demo and presentation judge on a hackathon judging panel.
-Evaluate the submission's demo/presentation on these criteria:
+You are a business value judge on a hackathon judging panel.
+Evaluate the submission on these criteria:
 
-1. Clarity — Is the problem and solution communicated clearly?
-2. Demo quality — Does the demo show a working prototype, not just slides?
-3. Persuasiveness — Would this convince a non-technical stakeholder?
-4. Completeness — Does the demo cover the end-to-end user journey?
+1. Market size — How large is the addressable market?
+2. ROI potential — How much value does this create for users/enterprises?
+3. Enterprise applicability — Could a real company deploy this?
+4. Time saved — Does this meaningfully reduce manual work?
 
 Return ONLY valid JSON:
 {
-  "demo_score": <0-100>,
+  "business_score": <0-100>,
   "reasoning": "<2-3 sentences justifying the score>",
   "confidence": "high" | "medium" | "low",
   "strengths": ["..."],
   "weaknesses": ["..."]
 }
-
-If no video transcript or slides are provided, score based on whatever
-context is available and set confidence to "low".
 """
 
 DEBATE_PROMPT = """\
-You are a demo/presentation judge participating in a hackathon panel debate.
-The panel scores have diverged, and the Head Judge has asked you to review the panel's scores and defend or adjust your demo/presentation score.
+You are a business value judge participating in a hackathon panel debate.
+The panel scores have diverged, and the Head Judge has asked you to review the panel's scores and defend or adjust your business score.
 
-Original Demo Score: {original_score}
+Original Business Score: {original_score}
 Original Reasoning: {original_reasoning}
 
 Here is the current state of the panel (other judges' scores, reasoning, and Head Judge's remarks):
@@ -88,28 +85,20 @@ Return ONLY valid JSON:
 """
 
 
-async def judge_demo_logic(video_transcript: str, kg_str: str) -> dict:
-    """Score the submission's demo / presentation."""
+async def judge_business_logic(submission_description: str, kg: str) -> dict:
+    """Score the submission on business value using the compressed knowledge graph."""
     llm = get_cheap_llm()
-
-    user_content = f"Knowledge graph (for background):\n{kg_str}\n\n"
-    if video_transcript and video_transcript.strip():
-        user_content += f"Video transcript:\n{video_transcript}"
-    else:
-        user_content += (
-            "No video transcript or slides were provided. "
-            "Score based on available context and set confidence to 'low'."
-        )
 
     messages = [
         ("system", SYSTEM_PROMPT),
-        ("human", user_content),
+        ("human", f"Knowledge graph:\n{kg}\n\n"
+                  f"Submission description:\n{submission_description}"),
     ]
 
     response = llm.invoke(messages)
 
     result = extract_json(response.content, {
-        "demo_score": 50,
+        "business_score": 50,
         "reasoning": "Could not parse LLM response.",
         "confidence": "low",
         "strengths": [],
@@ -119,8 +108,8 @@ async def judge_demo_logic(video_transcript: str, kg_str: str) -> dict:
     return result
 
 
-class DemoJudgeAgent(SimpleAdapter[HistoryProvider]):
-    """Demo / Presentation Judge Agent Adapter for the Band multi-agent room."""
+class BusinessJudgeAgent(SimpleAdapter[HistoryProvider]):
+    """Business Value Judge Agent Adapter for the Band multi-agent room."""
 
     async def on_message(
         self,
@@ -133,6 +122,17 @@ class DemoJudgeAgent(SimpleAdapter[HistoryProvider]):
         is_session_bootstrap: bool,
         room_id: str,
     ) -> None:
+        # Deduplicate — never process the same message twice
+        msg_id = getattr(msg, 'id', None)
+        agent_name = self.__class__.__name__
+        if msg_id:
+            if agent_name not in PROCESSED_MESSAGE_IDS:
+                PROCESSED_MESSAGE_IDS[agent_name] = set()
+            if msg_id in PROCESSED_MESSAGE_IDS[agent_name]:
+                print(f"[{agent_name}] Skipping duplicate message {msg_id[:8]}...")
+                return
+            PROCESSED_MESSAGE_IDS[agent_name].add(msg_id)
+
         # Skip messages from before this session started
         if hasattr(msg, 'created_at') and msg.created_at:
             try:
@@ -149,13 +149,13 @@ class DemoJudgeAgent(SimpleAdapter[HistoryProvider]):
 
         # 1. Listen for Debate Request (if we haven't responded to it yet)
         if has_responded_since(all_msgs, "[Debate Request]", "[Evaluate Submission]"):
-            if not has_responded_since(all_msgs, "[Debate Response Demo]", "[Debate Request]"):
-                # Run debate logic
-                original_score_data = get_latest_payload_since(all_msgs, "[Score Demo]", "[Evaluate Submission]") or {}
-                original_score = original_score_data.get("demo_score", 50)
+            if not has_responded_since(all_msgs, "[Debate Response Business]", "[Debate Request]"):
+                # Run debate logic!
+                original_score_data = get_latest_payload_since(all_msgs, "[Score Business]", "[Evaluate Submission]") or {}
+                original_score = original_score_data.get("business_score", 50)
                 original_reasoning = original_score_data.get("reasoning", "N/A")
 
-                # Compile debate context
+                # Compile debate context (all scores + Head Judge's debate request)
                 debate_request_payload = get_latest_payload_since(all_msgs, "[Debate Request]", "[Evaluate Submission]")
                 debate_context = json.dumps(debate_request_payload, indent=2)
 
@@ -174,11 +174,11 @@ class DemoJudgeAgent(SimpleAdapter[HistoryProvider]):
                 })
 
                 # Send debate response
-                await tools.send_event(content=f"[Debate Response Demo] {json.dumps(debate_res)}", message_type="task")
+                await tools.send_event(content=f"[Debate Response Business] {json.dumps(debate_res)}", message_type="task")
                 return
 
         # 2. Otherwise, perform initial scoring if we haven't done so yet
-        if has_responded_since(all_msgs, "[Score Demo]", "[Evaluate Submission]"):
+        if has_responded_since(all_msgs, "[Score Business]", "[Evaluate Submission]"):
             return
 
         # Check if Stage 1 results + KG + Fraud exist in the room
@@ -186,29 +186,30 @@ class DemoJudgeAgent(SimpleAdapter[HistoryProvider]):
         kg_payload = get_latest_payload_since(all_msgs, "[Knowledge Graph]", "[Evaluate Submission]")
         fraud = get_latest_payload_since(all_msgs, "[Fraud Result]", "[Evaluate Submission]")
 
+        # We must wait for all Stage 1 outputs & KG Builder output to be in the room
         if not submission or not kg_payload or not fraud:
             return
 
         # Handle early abort for fraud
         if fraud.get("abort_evaluation"):
             result = {
-                "demo_score": 0,
+                "business_score": 0,
                 "reasoning": "Disqualified due to fraud detector abort.",
                 "confidence": "high",
                 "strengths": [],
                 "weaknesses": ["fraud_abort"],
             }
-            await tools.send_event(content=post_score("demo_judge", result), message_type="task")
+            await tools.send_event(content=post_score("business_judge", result), message_type="task")
             return
 
-        # Run scoring logic
+        # Run business scoring
         kg = kg_payload.get("knowledge_graph", "")
-        video_transcript = submission.get("video_transcript", "")
-        result = await judge_demo_logic(video_transcript, kg)
+        description = submission.get("description", "")
+        result = await judge_business_logic(description, kg)
 
         # Broadcast score
-        await tools.send_event(content=post_score("demo_judge", result), message_type="task")
+        await tools.send_event(content=post_score("business_judge", result), message_type="task")
 
 
 # Singleton instance
-demo_judge = DemoJudgeAgent()
+business_judge = BusinessJudgeAgent()
